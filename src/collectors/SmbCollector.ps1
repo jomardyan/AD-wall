@@ -49,27 +49,31 @@ function Invoke-RemoteRegistry {
             }
         }
 
-        if ($ComputerName -ne 'localhost' -and $ComputerName -ne $env:COMPUTERNAME) {
-            $sessionParams = @{ ComputerName = $ComputerName }
-            if ($null -ne $Credential) { $sessionParams.Credential = $Credential }
-            $session = New-CimSession @sessionParams -ErrorAction Stop
-            $cimParams.CimSession = $session
+        $session = $null
+        try {
+            if ($ComputerName -ne 'localhost' -and $ComputerName -ne $env:COMPUTERNAME) {
+                $sessionParams = @{ ComputerName = $ComputerName }
+                if ($null -ne $Credential) { $sessionParams.Credential = $Credential }
+                $session = New-CimSession @sessionParams -ErrorAction Stop
+                $cimParams.CimSession = $session
+            }
+
+            $result = Invoke-CimMethod @cimParams -ErrorAction Stop
+
+            if ($result.ReturnValue -eq 0) {
+                return $result.uValue
+            }
+
+            # Fall back to GetStringValue using the same session
+            $cimParams.MethodName = 'GetStringValue'
+            $result2 = Invoke-CimMethod @cimParams -ErrorAction Stop
+            if ($result2.ReturnValue -eq 0) { return $result2.sValue }
+
+            return $null
         }
-
-        $result = Invoke-CimMethod @cimParams -ErrorAction Stop
-
-        if ($null -ne $session) { Remove-CimSession $session -ErrorAction SilentlyContinue }
-
-        if ($result.ReturnValue -eq 0) {
-            return $result.uValue
+        finally {
+            if ($null -ne $session) { Remove-CimSession $session -ErrorAction SilentlyContinue }
         }
-
-        # Fall back to GetStringValue
-        $cimParams.MethodName = 'GetStringValue'
-        $result2 = Invoke-CimMethod @cimParams -ErrorAction Stop
-        if ($result2.ReturnValue -eq 0) { return $result2.sValue }
-
-        return $null
     }
     catch {
         Write-Verbose "Registry read failed ($ComputerName\$Hive\$Key\$Value): $_"

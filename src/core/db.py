@@ -16,7 +16,9 @@ _DB_PATH: str = ""
 def configure(db_path: str) -> None:
     global _DB_PATH
     _DB_PATH = db_path
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def _connect() -> sqlite3.Connection:

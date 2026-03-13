@@ -100,7 +100,9 @@ function Convert-EventToObject {
 
         $eventData = @{}
         $xml.SelectNodes('//e:EventData/e:Data', $ns) | ForEach-Object {
-            if ($_.Name) { $eventData[$_.Name] = $_.'#text' }
+            # Use the XML attribute 'Name' (e.g., "SubjectUserSid"), not the element node name (always "Data")
+            $key = $_.GetAttribute('Name')
+            if ($key) { $eventData[$key] = $_.'#text' }
         }
 
         return [PSCustomObject]@{

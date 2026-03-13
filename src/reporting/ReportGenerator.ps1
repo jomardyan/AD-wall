@@ -4,7 +4,11 @@
     AD-Wall Report Generator Module
 .DESCRIPTION
     Generates HTML, CSV, JSON, and Markdown assessment reports from AD-Wall findings.
-    The HTML report is self-contained with embedded CSS and Chart.js visualizations.
+    The HTML report embeds all CSS and JavaScript inline for a single-file output.
+    Chart.js is loaded from the jsDelivr CDN (https://cdn.jsdelivr.net) at runtime.
+    Internet access is required to display the charts in the HTML report.
+    For fully offline viewing, download chart.umd.min.js from https://www.chartjs.org
+    and replace the <script src="..."> tag in New-HTMLReport with a local inline embed.
 .NOTES
     Author: AD-Wall Project
     Version: 1.0.0
@@ -53,10 +57,11 @@ function ConvertTo-HtmlSafe {
 function New-HTMLReport {
     <#
     .SYNOPSIS
-        Generates a self-contained HTML security assessment report.
+        Generates an HTML security assessment report.
     .DESCRIPTION
-        Creates a single HTML file with embedded CSS/JS including Chart.js charts,
+        Creates a single HTML file with embedded CSS and Chart.js charts (loaded from CDN),
         an executive summary, severity-grouped findings, and a remediation roadmap.
+        Internet access is required for Chart.js charts to render.
     .PARAMETER Findings
         Array of finding objects from Invoke-AllChecks.
     .PARAMETER PostureGrade
@@ -177,6 +182,8 @@ function New-HTMLReport {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>$ReportTitle</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<!-- NOTE: Chart.js is loaded from CDN. Internet access is required for charts to render.
+     For offline use, replace the src above with a locally hosted chart.umd.min.js file. -->
 <style>
   :root { --primary:#1a237e; --bg:#f5f5f5; }
   * { box-sizing:border-box; margin:0; padding:0; }

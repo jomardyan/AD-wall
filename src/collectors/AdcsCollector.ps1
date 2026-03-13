@@ -197,7 +197,11 @@ function Get-ADCSCertificateAuthorities {
         $caName = Get-Prop $ca 'name'
         $caHost = Get-Prop $ca 'dnshostname'
 
-        # Attempt to read CA flags via CertUtil/registry to detect EDITF_ATTRIBUTESUBJECTALTNAME2
+        # NOTE: EditFlags are read from the local machine's registry.
+        # This check is only accurate when the script runs directly on the CA host.
+        # For remote CAs ($caHost differs from $env:COMPUTERNAME), the value will be
+        # $null and ESC6_SANEditFlagSet will correctly default to $false rather than
+        # a false positive. To check remote CAs, use Invoke-Command or remote CIM.
         $caFlags = $null
         if ($caHost) {
             try {

@@ -173,7 +173,15 @@ function Get-OverallPostureGrade {
     $medScore    = if ($severityCounts.Medium      -gt 0) { [Math]::Min(100, $severityCounts.Medium      * 5)  } else { 0 }
     $lowScore    = if ($severityCounts.Low         -gt 0) { [Math]::Min(100, $severityCounts.Low         * 2)  } else { 0 }
 
-    $compositeScore = ($critScore * 0.50) + ($highScore * 0.30) + ($medScore * 0.15) + ($lowScore * 0.05)
+    $severityScore = ($critScore * 0.50) + ($highScore * 0.30) + ($medScore * 0.15) + ($lowScore * 0.05)
+
+    # Blend 70% severity-based score with 30% average per-finding score (which factors in
+    # exploitability, affected-object count, and age multipliers via Calculate-RiskScore).
+    $avgFindingScore = if ($findingScores.Count -gt 0) {
+        ($findingScores | Measure-Object -Sum).Sum / $findingScores.Count
+    } else { 0 }
+
+    $compositeScore = ($severityScore * 0.70) + ($avgFindingScore * 0.30)
     $finalScore     = [Math]::Min(100, [Math]::Round($compositeScore, 1))
 
     $grade = switch ($true) {

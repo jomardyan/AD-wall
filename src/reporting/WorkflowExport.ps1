@@ -553,7 +553,9 @@ function Get-FindingFixGuide {
         [string]$Format = 'Object'
     )
 
-    # Lookup table for verification commands by RuleId
+    # Lookup table for verification commands by RuleId.
+    # Domain-specific paths use (Get-ADDomain).DistinguishedName so commands are accurate
+    # in any environment rather than hardcoding an example domain like DC=corp,DC=local.
     $verificationCmds = @{
         'IP-001' = 'Get-ADGroupMember -Identity "Domain Admins" -Recursive | Select-Object SamAccountName, objectClass'
         'IP-002' = 'Get-ADGroupMember -Identity "Domain Admins" -Recursive | Where-Object { $_.objectClass -eq "user" } | Get-ADUser -Properties ServicePrincipalNames | Where-Object { $_.ServicePrincipalNames }'
@@ -574,15 +576,15 @@ function Get-FindingFixGuide {
         'CG-005' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel"'
         'CG-010' = 'Get-ChildItem -Path "\\$env:USERDNSDOMAIN\SYSVOL" -Recurse -Filter "*.xml" | Select-String "cpassword"'
         'CG-020' = 'Get-ADTrust -Filter * | Select-Object Name, TrustAttributes, SIDFilteringForestAware, SIDFilteringQuarantined'
-        'CG-030' = '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference, ActiveDirectoryRights'
+        'CG-030' = '$dn = (Get-ADDomain).DistinguishedName; (Get-ACL "AD:$dn").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference, ActiveDirectoryRights'
         'CG-040' = 'Get-ChildItem "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\Policies" -Recurse -Filter "GptTmpl.inf" | Select-String "SeDebugPrivilege|SeTcbPrivilege"'
         'EV-001' = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null"} | Select-Object SamAccountName, ServicePrincipalNames, PasswordLastSet'
         'EV-010' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "FullSecureChannelProtection" -ErrorAction SilentlyContinue'
         'EV-020' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LdapEnforceChannelBinding" -ErrorAction SilentlyContinue'
         'EV-030' = 'Get-Service -ComputerName (Get-ADDomainController -Filter *).HostName -Name "Spooler" | Select-Object MachineName, Status'
-        'PB-001' = '(Get-ACL "AD:CN=AdminSDHolder,CN=System,DC=corp,DC=local").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference, ActiveDirectoryRights'
+        'PB-001' = '$dn = (Get-ADDomain).DistinguishedName; (Get-ACL "AD:CN=AdminSDHolder,CN=System,$dn").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference, ActiveDirectoryRights'
         'PB-010' = 'Get-ADUser -Filter {SIDHistory -like "*"} -Properties SIDHistory | Select-Object SamAccountName, SIDHistory'
-        'PB-020' = '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" } | Select-Object IdentityReference'
+        'PB-020' = '$dn = (Get-ADDomain).DistinguishedName; (Get-ACL "AD:$dn").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" } | Select-Object IdentityReference'
         'PB-030' = 'Get-Process -ComputerName (Get-ADDomainController -Filter *).HostName | Where-Object { $_.Name -in @("mimikatz","mimilib","wce","fgdump") }'
         'PB-050' = 'Get-ChildItem "\\$env:USERDNSDOMAIN\NETLOGON" | Select-Object Name, LastWriteTime, Attributes'
         'PB-060' = 'Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "*\Microsoft\*" -and $_.Principal.UserId -match "SYSTEM" } | Select-Object TaskName, TaskPath, @{N="RunAs";E={$_.Principal.UserId}}'
