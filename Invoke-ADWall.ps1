@@ -201,6 +201,7 @@ Write-Step "Loading modules…" 'INFO'
 
 Import-ADWallModule 'src\core\Config.ps1'
 Import-ADWallModule 'src\core\Database.ps1'
+Import-ADWallModule 'src\core\FindingHelper.ps1'   # shared New-Finding / New-ATKFinding factory
 Import-ADWallModule 'src\collectors\LdapCollector.ps1'
 Import-ADWallModule 'src\collectors\SmbCollector.ps1'
 Import-ADWallModule 'src\collectors\EventLogCollector.ps1'

@@ -135,6 +135,7 @@ function Get-OverallPostureGrade {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Findings,
 
         [Parameter(Mandatory = $false)]
@@ -241,6 +242,7 @@ function Get-QuickWins {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Findings,
 
         [int]$TopN = 10
@@ -307,6 +309,7 @@ function Get-CriticalPaths {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Findings
     )
 
@@ -405,6 +408,7 @@ function Get-RemediationRoadmap {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Findings
     )
 

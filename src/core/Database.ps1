@@ -72,9 +72,12 @@ function Initialize-ADWallDatabase {
         }
         else {
             $Script:DbIndex = Get-Content $Script:IndexPath -Raw | ConvertFrom-Json -AsHashtable
-            # Ensure list types survive round-trip
-            if ($null -eq $Script:DbIndex.Runs)      { $Script:DbIndex.Runs      = [System.Collections.Generic.List[object]]::new() }
-            if ($null -eq $Script:DbIndex.Snapshots) { $Script:DbIndex.Snapshots = [System.Collections.Generic.List[object]]::new() }
+            # ConvertFrom-Json deserialises arrays as fixed-size PowerShell arrays.
+            # Always re-wrap as a generic list so that .Add() works at runtime.
+            $Script:DbIndex.Runs      = [System.Collections.Generic.List[object]]::new(
+                [object[]]($Script:DbIndex.Runs      ?? @()))
+            $Script:DbIndex.Snapshots = [System.Collections.Generic.List[object]]::new(
+                [object[]]($Script:DbIndex.Snapshots ?? @()))
         }
 
         Write-Verbose "Database initialized at: $Script:DbPath"
@@ -404,25 +407,32 @@ function Compare-Snapshots {
     $baseData = $baseline.Data
     $currData = $current.Data
 
+    # Build the union of all category names so categories present in only one
+    # snapshot (i.e. completely new or fully removed object types) are included.
     $allCategories = @($baseData.PSObject.Properties.Name) + @($currData.PSObject.Properties.Name) | Sort-Object -Unique
 
     foreach ($category in $allCategories) {
+        # Use DistinguishedName as the stable primary key for each AD object.
         $baseItems = if ($baseData.PSObject.Properties[$category]) { @($baseData.$category) } else { @() }
         $currItems = if ($currData.PSObject.Properties[$category]) { @($currData.$category) } else { @() }
 
         $baseKeys = $baseItems | ForEach-Object { "$($_.DistinguishedName)" }
         $currKeys = $currItems | ForEach-Object { "$($_.DistinguishedName)" }
 
+        # Added: present in current but absent from baseline (DN not in baseline key set).
         $added   = $currItems | Where-Object { $_.DistinguishedName -notin $baseKeys }
+        # Removed: present in baseline but absent from current (DN not in current key set).
         $removed = $baseItems | Where-Object { $_.DistinguishedName -notin $currKeys }
 
-        # Detect modifications on common items
+        # Modified: DN exists in both snapshots but one or more property values differ.
         $modified = [System.Collections.Generic.List[object]]::new()
         foreach ($curr in $currItems) {
             $base = $baseItems | Where-Object { $_.DistinguishedName -eq $curr.DistinguishedName } | Select-Object -First 1
             if ($null -ne $base) {
                 $changes = Compare-ObjectProperties -Base $base -Current $curr
-                if ($changes.Count -gt 0) {
+                # Guard against $null: PowerShell flattens an empty array returned from
+                # a function into $null, so we check for null before accessing .Count.
+                if (($null -ne $changes) -and (@($changes).Count -gt 0)) {
                     $modified.Add([PSCustomObject]@{
                         DistinguishedName = $curr.DistinguishedName
                         Changes           = $changes
@@ -474,15 +484,37 @@ function Save-DbIndex {
 }
 
 function Compare-ObjectProperties {
+    <#
+    .SYNOPSIS
+        Deep-compares two PSCustomObjects and returns a list of changed properties.
+    .DESCRIPTION
+        Iterates over the union of all property names from both objects and serialises
+        each value to a compact JSON string so that nested collections (arrays,
+        hashtables) are compared by value rather than by object reference.  Only
+        properties whose serialised representations differ are included in the output.
+    .PARAMETER Base
+        The earlier (baseline) object.
+    .PARAMETER Current
+        The later (current) object.
+    .OUTPUTS
+        Array of [PSCustomObject] records with Property, OldValue, and NewValue fields.
+        Always returns an array (empty when objects are identical) so callers can safely
+        use .Count without strict-mode null-reference errors.
+    #>
     param($Base, $Current)
 
     $changes = [System.Collections.Generic.List[object]]::new()
+
+    # Build the union of all property names from both snapshots so that
+    # newly added or removed properties are also detected as changes.
     $props = @($Current.PSObject.Properties.Name) + @($Base.PSObject.Properties.Name) | Sort-Object -Unique
 
     foreach ($prop in $props) {
         $baseVal = if ($Base.PSObject.Properties[$prop])    { $Base.$prop }    else { $null }
         $currVal = if ($Current.PSObject.Properties[$prop]) { $Current.$prop } else { $null }
 
+        # Serialise to JSON for a content-aware deep comparison.
+        # Depth 3 is sufficient for AD attribute values (strings, arrays, nested objects).
         $baseStr = if ($null -ne $baseVal) { $baseVal | ConvertTo-Json -Compress -Depth 3 } else { 'null' }
         $currStr = if ($null -ne $currVal) { $currVal | ConvertTo-Json -Compress -Depth 3 } else { 'null' }
 
@@ -495,7 +527,7 @@ function Compare-ObjectProperties {
         }
     }
 
-    return $changes
+    return $changes.ToArray()
 }
 
 #endregion
