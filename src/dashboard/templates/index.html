@@ -1,0 +1,1401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AD-Wall Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --sidebar-width: 230px;
+      --primary: #1a237e;
+      --primary-light: #3949ab;
+    }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f4f6fb; }
+    #sidebar {
+      position: fixed; top: 0; left: 0; height: 100vh;
+      width: var(--sidebar-width); background: var(--primary); color: #fff;
+      display: flex; flex-direction: column; z-index: 200; transition: width 0.2s;
+    }
+    #sidebar .brand { padding: 22px 20px 18px; font-size: 1.2em; font-weight: 700;
+      border-bottom: 1px solid rgba(255,255,255,0.1); letter-spacing: 0.04em; }
+    #sidebar .brand span { color: #90caf9; }
+    #sidebar nav a {
+      display: flex; align-items: center; gap: 10px; padding: 12px 20px;
+      color: rgba(255,255,255,0.78); text-decoration: none; font-size: 0.93em;
+      transition: background 0.15s, color 0.15s; border-radius: 0;
+    }
+    #sidebar nav a:hover, #sidebar nav a.active {
+      background: rgba(255,255,255,0.12); color: #fff;
+    }
+    #sidebar nav a i { font-size: 1.1em; width: 20px; text-align: center; }
+    #sidebar .sidebar-footer { margin-top: auto; padding: 12px 20px;
+      font-size: 0.78em; color: rgba(255,255,255,0.4); }
+    #main { margin-left: var(--sidebar-width); min-height: 100vh; }
+    .topbar {
+      background: #fff; border-bottom: 1px solid #e0e4ef; padding: 0 24px;
+      height: 56px; display: flex; align-items: center; gap: 12px;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .topbar h6 { margin: 0; font-weight: 700; color: var(--primary); }
+    .topbar .ms-auto { margin-left: auto !important; }
+    .severity-Critical { color: #b71c1c; font-weight: 700; }
+    .severity-High     { color: #e65100; font-weight: 600; }
+    .severity-Medium   { color: #f57f17; font-weight: 600; }
+    .severity-Low      { color: #2e7d32; }
+    .severity-Informational { color: #1565c0; }
+    .badge-critical { background: #b71c1c; }
+    .badge-high     { background: #e65100; }
+    .badge-medium   { background: #f57f17; }
+    .badge-low      { background: #2e7d32; }
+    .badge-informational { background: #1565c0; }
+    .grade-badge { font-size: 2.5rem; font-weight: 900; line-height: 1; }
+    .card { border: none; box-shadow: 0 1px 4px rgba(0,0,0,0.07); border-radius: 10px; }
+    .card-header { background: none; border-bottom: 1px solid #eef0f8; font-weight: 700; }
+    .finding-row { cursor: pointer; transition: background 0.1s; }
+    .finding-row:hover { background: #f0f4ff; }
+    .page-section { display: none; }
+    .page-section.active { display: block; }
+    .terminal-log {
+      background: #0d1117; color: #c9d1d9; font-family: monospace; font-size: 0.82em;
+      padding: 14px; border-radius: 8px; max-height: 400px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .terminal-log .log-ERROR   { color: #ff7b72; }
+    .terminal-log .log-WARNING { color: #d29922; }
+    .terminal-log .log-DEBUG   { color: #8b949e; }
+    .terminal-log .log-INFO    { color: #c9d1d9; }
+    .cmd-preview {
+      background: #0d1117; color: #79c0ff; font-family: monospace; font-size: 0.83em;
+      padding: 12px 16px; border-radius: 8px; white-space: pre-wrap; word-break: break-all;
+      min-height: 52px;
+    }
+    .status-running  { color: #1565c0; }
+    .status-completed{ color: #2e7d32; }
+    .status-failed   { color: #b71c1c; }
+    .status-pending  { color: #888; }
+    .status-preview  { color: #f57f17; }
+    @media (max-width: 768px) {
+      #sidebar { width: 60px; }
+      #sidebar .brand span, #sidebar nav a span, #sidebar .sidebar-footer { display: none; }
+      #main { margin-left: 60px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<div id="sidebar">
+  <div class="brand"><i class="bi bi-shield-shaded me-2"></i><span>AD-<span>Wall</span></span></div>
+  <nav class="mt-2">
+    <a href="#" data-page="overview" class="active"><i class="bi bi-speedometer2"></i><span>Overview</span></a>
+    <a href="#" data-page="identity"><i class="bi bi-person-lock"></i><span>Identity &amp; Privilege</span></a>
+    <a href="#" data-page="config"><i class="bi bi-shield-lock"></i><span>Config &amp; GPO</span></a>
+    <a href="#" data-page="exploits"><i class="bi bi-bug"></i><span>Exploits &amp; Vulns</span></a>
+    <a href="#" data-page="persistence"><i class="bi bi-eye-slash"></i><span>Persistence</span></a>
+    <a href="#" data-page="detection"><i class="bi bi-radar"></i><span>Detection Eng.</span></a>
+    <a href="#" data-page="compliance"><i class="bi bi-patch-check"></i><span>Compliance</span></a>
+    <a href="#" data-page="attackpaths"><i class="bi bi-diagram-3"></i><span>Attack Paths</span></a>
+    <a href="#" data-page="drift"><i class="bi bi-graph-up-arrow"></i><span>Drift Analysis</span></a>
+    <a href="#" data-page="redteam" style="color:#ff6b6b;"><i class="bi bi-crosshair"></i><span>🔴 Red Team</span></a>
+    <hr style="border-color:rgba(255,255,255,0.12);margin:6px 0;">
+    <a href="#" data-page="run"><i class="bi bi-play-circle"></i><span>Run Assessment</span></a>
+    <a href="#" data-page="history"><i class="bi bi-clock-history"></i><span>Run History</span></a>
+    <a href="#" data-page="reports"><i class="bi bi-file-earmark-text"></i><span>Reports</span></a>
+  </nav>
+  <div class="sidebar-footer">AD-Wall v1.0.0</div>
+</div>
+
+<!-- Main -->
+<div id="main">
+  <!-- Topbar -->
+  <div class="topbar">
+    <h6><i class="bi bi-shield-shaded me-2 text-primary"></i>AD Security Assessment Dashboard</h6>
+    <div class="ms-auto d-flex gap-2 align-items-center">
+      <!-- Run Selector -->
+      <div class="dropdown me-1">
+        <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" id="runSelectorBtn" data-bs-toggle="dropdown" aria-expanded="false">
+          <i class="bi bi-layers me-1"></i><span id="runSelectorLabel">Latest Run</span>
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end" id="runSelectorMenu" style="min-width:320px;max-height:320px;overflow-y:auto;">
+          <li><h6 class="dropdown-header">Select Run</h6></li>
+          <li><a class="dropdown-item active" href="#" onclick="selectRun(null)"><i class="bi bi-star me-2"></i>Latest Run</a></li>
+          <li><hr class="dropdown-divider"></li>
+          <li><span class="dropdown-item text-muted small" id="runSelectorLoading">Loading...</span></li>
+        </ul>
+      </div>
+      <button class="btn btn-outline-secondary btn-sm" onclick="refreshAll()">
+        <i class="bi bi-arrow-clockwise"></i> Refresh</button>
+      <div class="dropdown">
+        <button class="btn btn-primary btn-sm dropdown-toggle" data-bs-toggle="dropdown">
+          <i class="bi bi-download"></i> Export</button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><a class="dropdown-item" href="/api/export"><i class="bi bi-file-earmark-spreadsheet me-2"></i>CSV</a></li>
+          <li><a class="dropdown-item" href="/api/export/cef"><i class="bi bi-broadcast me-2"></i>CEF (SIEM)</a></li>
+          <li><a class="dropdown-item" href="/api/export/splunk"><i class="bi bi-lightning me-2"></i>Splunk JSON</a></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- No data banner -->
+  {% if not has_data %}
+  <div class="alert alert-warning d-flex align-items-center gap-2 m-3" role="alert">
+    <i class="bi bi-exclamation-triangle-fill fs-4"></i>
+    <div>No assessment data found. Run <code>Invoke-ADWall.ps1</code> and place the output in the
+      <code>output/</code> directory, or use the <strong>Run Assessment</strong> page.</div>
+  </div>
+  {% endif %}
+
+  <div class="p-3">
+
+    <!-- ═══════════════════════════════ OVERVIEW ════════════════════════════════ -->
+    <div id="page-overview" class="page-section active">
+      <div class="row g-3 mb-3" id="scoreCards">
+        <div class="col-md-3"><div class="card p-3 text-center">
+          <div class="text-muted small mb-1">Security Grade</div>
+          <div class="grade-badge text-primary" id="gradeDisplay">—</div>
+          <div class="text-muted small mt-1" id="scoreDisplay">Score: —</div>
+        </div></div>
+        <div class="col-md-3"><div class="card p-3 text-center">
+          <div class="text-muted small mb-1">Total Findings</div>
+          <div class="fs-1 fw-bold text-dark" id="totalDisplay">—</div>
+          <div class="text-muted small mt-1" id="generatedAt">—</div>
+        </div></div>
+        <div class="col-md-3"><div class="card p-3">
+          <div class="text-muted small mb-2">Severity Breakdown</div>
+          <div id="severityBreakdown"></div>
+        </div></div>
+        <div class="col-md-3"><div class="card p-3">
+          <div class="text-muted small mb-2">By Category</div>
+          <canvas id="categoryChart" height="120"></canvas>
+        </div></div>
+      </div>
+      <div class="card mb-3">
+        <div class="card-header d-flex align-items-center gap-2">
+          <i class="bi bi-exclamation-octagon-fill"></i> Critical &amp; High Priority Findings
+        </div>
+        <div class="card-body p-0">
+          <div id="criticalFindings" class="p-3 text-muted">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ CATEGORY PAGES ══════════════════════════════ -->
+    <div id="page-identity"    class="page-section"><div id="findingsIdentity"></div></div>
+    <div id="page-config"      class="page-section"><div id="findingsConfig"></div></div>
+    <div id="page-exploits"    class="page-section"><div id="findingsExploits"></div></div>
+    <div id="page-persistence" class="page-section"><div id="findingsPersistence"></div></div>
+    <div id="page-detection"   class="page-section"><div id="findingsDetection"></div></div>
+
+    <!-- ═══════════════════════════ COMPLIANCE ══════════════════════════════════ -->
+    <div id="page-compliance" class="page-section">
+      <div id="complianceContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>Loading compliance data…
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ ATTACK PATHS ════════════════════════════════ -->
+    <div id="page-attackpaths" class="page-section">
+      <div id="attackPathsContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>Loading attack paths…
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ DRIFT ANALYSIS ══════════════════════════════ -->
+    <div id="page-drift" class="page-section">
+      <div id="driftContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>Loading drift analysis…
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ RED TEAM ══════════════════════════════ -->
+    <div id="page-redteam" class="page-section">
+      <!-- Active-run Red Team banner -->
+      <div id="redteam-active-banner" class="alert alert-danger d-none mb-3" role="alert">
+        <i class="bi bi-exclamation-triangle-fill me-2"></i>
+        <strong>Red Team mode was active in this run.</strong>
+        Simulation results and offensive analysis are available below.
+        All operations were READ-ONLY enumeration.
+      </div>
+
+      <!-- Safe mode warning -->
+      <div class="alert alert-warning mb-3" role="alert">
+        <i class="bi bi-shield-exclamation me-2"></i>
+        <strong>Red Team Simulation requires <code>-SafeMode:$false</code></strong> to perform active checks.
+        In safe mode (default), functions return metadata only — what they would target, commands they would run, and expected impact.
+        <br><small class="text-muted mt-1 d-block">To enable: <code>Invoke-ADWall.ps1 -RedTeam -SafeMode:$false</code> — use only in authorised assessments.</small>
+      </div>
+
+      <div class="row g-3">
+        <!-- LEFT: Blue Team Detection Summary -->
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header">
+              <i class="bi bi-shield-check me-2 text-primary"></i><strong>Blue Team — Detection Coverage</strong>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-sm table-hover mb-0" id="attackTechniquesTable">
+                  <thead class="table-dark">
+                    <tr>
+                      <th>Attack</th>
+                      <th>MITRE</th>
+                      <th>Severity</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="attackTechniquesBody">
+                    <tr><td colspan="4" class="text-center text-muted py-3"><i class="bi bi-hourglass-split me-2"></i>Loading…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: Red Team Simulation Controls -->
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex align-items-center">
+              <span class="badge bg-danger me-2">RED</span><strong>Red Team — Simulation Checks</strong>
+            </div>
+            <div class="card-body">
+              <div id="redteam-simulation-list">
+                <div class="text-center text-muted py-3"><i class="bi bi-hourglass-split me-2"></i>Loading…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detailed findings for a selected technique -->
+      <div id="redteam-detail-panel" class="mt-3 d-none">
+        <div class="card border-danger">
+          <div class="card-header bg-danger text-white">
+            <i class="bi bi-crosshair me-2"></i><span id="redteam-detail-title">Attack Detail</span>
+          </div>
+          <div class="card-body" id="redteam-detail-body"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ RUN ASSESSMENT ══════════════════════════════ -->
+    <div id="page-run" class="page-section">
+      <h5 class="fw-bold mb-3"><i class="bi bi-play-circle me-2 text-primary"></i>Run Assessment</h5>
+      <div class="row g-3">
+        <!-- LEFT COLUMN -->
+        <div class="col-lg-6">
+          <!-- Basic Settings -->
+          <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-gear me-2"></i>Basic Settings</div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Domain Controller <span class="text-danger">*</span></label>
+                <input type="text" class="form-control" id="f-dc" placeholder="dc01.corp.local" oninput="updateCommand()">
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Organisation Name</label>
+                <input type="text" class="form-control" id="f-orgName" placeholder="ACME Corp" oninput="updateCommand()">
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Output Path</label>
+                <input type="text" class="form-control" id="f-outputPath" value="./output" oninput="updateCommand()">
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Mode</label>
+                <select class="form-select" id="f-mode" onchange="updateCommand(); toggleAlertingCard()">
+                  <option value="Assessment" selected>Assessment</option>
+                  <option value="Validation">Validation</option>
+                  <option value="Monitoring">Monitoring</option>
+                </select>
+              </div>
+              <div class="mb-0">
+                <label class="form-label fw-semibold">Stale Account Days</label>
+                <input type="number" class="form-control" id="f-staleAccountDays" value="90" min="1" oninput="updateCommand()">
+              </div>
+            </div>
+          </div>
+
+          <!-- Modules -->
+          <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-grid me-2"></i>Modules</div>
+            <div class="card-body">
+              <div class="row row-cols-2 g-2" id="modulesGroup">
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Identity" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Identity">Identity</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Config" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Config">Config</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Exploit" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Exploit">Exploit</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Persistence" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Persistence">Persistence</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Detection" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Detection">Detection</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="m-Compliance" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="m-Compliance">Compliance</label>
+                </div></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Output Formats -->
+          <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-file-earmark-code me-2"></i>Output Formats</div>
+            <div class="card-body">
+              <div class="row row-cols-3 g-2" id="formatsGroup">
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-HTML" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-HTML">HTML</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-JSON" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-JSON">JSON</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-CSV" onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-CSV">CSV</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-Markdown" onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-Markdown">Markdown</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-CEF" onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-CEF">CEF (SIEM)</label>
+                </div></div>
+                <div class="col"><div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="fmt-Splunk" onchange="updateCommand()">
+                  <label class="form-check-label" for="fmt-Splunk">Splunk</label>
+                </div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT COLUMN -->
+        <div class="col-lg-6">
+          <!-- Advanced Options -->
+          <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-sliders me-2"></i>Advanced Options</span>
+              <button class="btn btn-sm btn-link text-muted p-0" data-bs-toggle="collapse" data-bs-target="#advancedCollapse">Toggle</button>
+            </div>
+            <div class="collapse show" id="advancedCollapse">
+              <div class="card-body">
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="f-safeMode" checked onchange="updateCommand()">
+                  <label class="form-check-label" for="f-safeMode">Safe Mode <small class="text-muted">(recommended)</small></label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="f-redTeam" onchange="updateCommand(); toggleRedTeamWarning()">
+                  <label class="form-check-label" for="f-redTeam">Red Team Mode</label>
+                </div>
+                <div id="redTeamWarning" class="alert alert-warning mt-2 py-2 d-none small">
+                  <i class="bi bi-exclamation-triangle me-1"></i>
+                  Red Team mode enables aggressive exploitation checks. Only use in authorised engagements.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SIEM / Workflow Integration -->
+          <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-plug me-2"></i>SIEM / Workflow Integration</span>
+              <button class="btn btn-sm btn-link text-muted p-0" data-bs-toggle="collapse" data-bs-target="#siemCollapse">Toggle</button>
+            </div>
+            <div class="collapse" id="siemCollapse">
+              <div class="card-body">
+                <div class="form-check mb-3">
+                  <input class="form-check-input" type="checkbox" id="f-siemExport" onchange="updateCommand()">
+                  <label class="form-check-label" for="f-siemExport">SIEM Export</label>
+                </div>
+                <div class="mb-2"><label class="form-label small fw-semibold">Jira URL</label>
+                  <input type="text" class="form-control form-control-sm" id="f-jiraUrl" placeholder="https://jira.example.com" oninput="updateCommand()"></div>
+                <div class="row g-2 mb-2">
+                  <div class="col"><label class="form-label small fw-semibold">Jira Project</label>
+                    <input type="text" class="form-control form-control-sm" id="f-jiraProject" placeholder="SEC" oninput="updateCommand()"></div>
+                  <div class="col"><label class="form-label small fw-semibold">Jira User</label>
+                    <input type="text" class="form-control form-control-sm" id="f-jiraUser" oninput="updateCommand()"></div>
+                </div>
+                <div class="mb-3"><label class="form-label small fw-semibold">Jira Token</label>
+                  <input type="password" class="form-control form-control-sm" id="f-jiraToken" oninput="updateCommand()"></div>
+                <hr>
+                <div class="mb-2"><label class="form-label small fw-semibold">ServiceNow URL</label>
+                  <input type="text" class="form-control form-control-sm" id="f-snUrl" placeholder="https://instance.service-now.com" oninput="updateCommand()"></div>
+                <div class="row g-2">
+                  <div class="col"><label class="form-label small fw-semibold">SN User</label>
+                    <input type="text" class="form-control form-control-sm" id="f-snUser" oninput="updateCommand()"></div>
+                  <div class="col"><label class="form-label small fw-semibold">SN Password</label>
+                    <input type="password" class="form-control form-control-sm" id="f-snPass" oninput="updateCommand()"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Alerting (Monitoring mode only) -->
+          <div class="card mb-3" id="alertingCard" style="display:none!important">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-bell me-2"></i>Alerting</span>
+              <button class="btn btn-sm btn-link text-muted p-0" data-bs-toggle="collapse" data-bs-target="#alertCollapse">Toggle</button>
+            </div>
+            <div class="collapse show" id="alertCollapse">
+              <div class="card-body">
+                <div class="mb-2"><label class="form-label small fw-semibold">Alert Email</label>
+                  <input type="email" class="form-control form-control-sm" id="f-alertEmail" oninput="updateCommand()"></div>
+                <div class="row g-2 mb-2">
+                  <div class="col-8"><label class="form-label small fw-semibold">SMTP Server</label>
+                    <input type="text" class="form-control form-control-sm" id="f-smtpServer" oninput="updateCommand()"></div>
+                  <div class="col-4"><label class="form-label small fw-semibold">Port</label>
+                    <input type="number" class="form-control form-control-sm" id="f-smtpPort" value="587" oninput="updateCommand()"></div>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="f-alertOnDrift" onchange="updateCommand()">
+                  <label class="form-check-label" for="f-alertOnDrift">Alert on Drift</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Generated Command -->
+          <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-terminal me-2"></i>Generated PowerShell Command</span>
+              <button class="btn btn-sm btn-outline-secondary" onclick="copyCommand()">
+                <i class="bi bi-clipboard"></i> Copy</button>
+            </div>
+            <div class="card-body p-0">
+              <div class="cmd-preview p-3" id="cmdPreview">Loading…</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Run Button + Status -->
+      <div class="text-end mb-3">
+        <button class="btn btn-success btn-lg px-4" id="runBtn" onclick="startRun()">
+          <i class="bi bi-play-fill me-2"></i>Run Assessment
+        </button>
+      </div>
+
+      <!-- Live Log Viewer -->
+      <div id="runLogSection" style="display:none">
+        <div class="card">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-terminal me-2"></i>Live Output — Run <code id="activeRunId"></code></span>
+            <span class="badge bg-secondary" id="runStatusBadge">running</span>
+          </div>
+          <div class="card-body p-0">
+            <div class="terminal-log" id="terminalLog"></div>
+          </div>
+          <div class="card-footer text-end d-none" id="viewResultsFooter">
+            <button class="btn btn-primary" onclick="viewRunResults()">
+              <i class="bi bi-bar-chart me-2"></i>View Results</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ RUN HISTORY ══════════════════════════════════ -->
+    <div id="page-history" class="page-section">
+      <h5 class="fw-bold mb-3"><i class="bi bi-clock-history me-2 text-primary"></i>Run History</h5>
+      <div class="card">
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th>Run ID</th>
+                  <th>Date / Time</th>
+                  <th>Mode</th>
+                  <th>Domain Controller</th>
+                  <th>Status</th>
+                  <th>Grade</th>
+                  <th>Findings</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="historyTableBody">
+                <tr><td colspan="8" class="text-center text-muted py-4">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ REPORTS ══════════════════════════════════════ -->
+    <div id="page-reports" class="page-section">
+      <h5 class="fw-bold mb-3"><i class="bi bi-file-earmark-text me-2 text-primary"></i>Reports</h5>
+      <div class="card">
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th>Run</th>
+                  <th>Generated</th>
+                  <th>Format</th>
+                  <th>Filename</th>
+                  <th>Size</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="reportsTableBody">
+                <tr><td colspan="6" class="text-center text-muted py-4">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /p-3 -->
+</div><!-- /#main -->
+
+<!-- ═══════════════════════ MODALS ════════════════════════════════════════════ -->
+
+<!-- Fix Guide Modal -->
+<div class="modal fade" id="fixGuideModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="fixGuideModalLabel"><i class="bi bi-tools me-2"></i>Fix Guide</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="fixGuideBody">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- Run Logs Modal -->
+<div class="modal fade" id="logsModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-terminal me-2"></i>Run Logs — <span id="logsModalRunId"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div class="terminal-log" id="logsModalBody" style="max-height:500px">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Report Preview Modal -->
+<div class="modal fade" id="reportPreviewModal" tabindex="-1">
+  <div class="modal-dialog modal-xl">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-eye me-2"></i>Report Preview</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <iframe id="reportPreviewFrame" src="" style="width:100%;height:70vh;border:none;"></iframe>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+'use strict';
+
+// ─────────────────────────── State ───────────────────────────────────────────
+let currentRunId = null;   // null = "latest run"
+let _categoryChart = null;
+let _pollTimer = null;
+let _lastLogId = 0;
+let _activeRunId = null;
+
+// ─────────────────────────── Utilities ───────────────────────────────────────
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function fmtDate(s) {
+  if (!s) return '—';
+  try { return new Date(s).toLocaleString(); } catch { return s; }
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '—';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/1048576).toFixed(1) + ' MB';
+}
+
+function sevBadgeClass(sev) {
+  const m = {Critical:'danger',High:'warning',Medium:'warning text-dark',Low:'success',Informational:'info text-dark'};
+  return 'badge bg-' + (m[sev] || 'secondary');
+}
+
+function gradeBadgeClass(g) {
+  const m = {A:'success',B:'info',C:'warning',D:'danger',F:'danger'};
+  return 'badge bg-' + (m[(g||'')[0]] || 'secondary');
+}
+
+function statusBadge(status) {
+  const m = {completed:'success',running:'primary',failed:'danger',pending:'secondary',preview:'warning'};
+  return `<span class="badge bg-${m[status]||'secondary'}">${esc(status)}</span>`;
+}
+
+// ─────────────────────────── Sidebar / Page Nav ───────────────────────────────
+document.querySelectorAll('#sidebar nav a').forEach(link => {
+  link.addEventListener('click', e => {
+    e.preventDefault();
+    const page = link.dataset.page;
+    document.querySelectorAll('#sidebar nav a').forEach(a => a.classList.remove('active'));
+    link.classList.add('active');
+    document.querySelectorAll('.page-section').forEach(s => s.classList.remove('active'));
+    document.getElementById('page-' + page).classList.add('active');
+    onPageActivate(page);
+  });
+});
+
+function onPageActivate(page) {
+  if (page === 'overview')   { loadScoreAndFindings(); }
+  if (page === 'identity')   { loadCategoryFindings('Identity', 'findingsIdentity'); }
+  if (page === 'config')     { loadCategoryFindings('Config', 'findingsConfig'); }
+  if (page === 'exploits')   { loadCategoryFindings('Exploit', 'findingsExploits'); }
+  if (page === 'persistence'){ loadCategoryFindings('Persistence', 'findingsPersistence'); }
+  if (page === 'detection')  { loadCategoryFindings('Detection', 'findingsDetection'); }
+  if (page === 'compliance') { loadCompliance(); }
+  if (page === 'attackpaths'){ loadAttackPaths(); }
+  if (page === 'drift')      { loadDrift(); }
+  if (page === 'redteam')    { loadRedTeamPage(); }
+  if (page === 'run')        { updateCommand(); }
+  if (page === 'history')    { loadHistory(); }
+  if (page === 'reports')    { loadReports(); }
+}
+
+// ─────────────────────────── Run Selector ────────────────────────────────────
+async function populateRunSelector() {
+  try {
+    const data = await fetchJSON('/api/runs');
+    const menu = document.getElementById('runSelectorMenu');
+    const loading = document.getElementById('runSelectorLoading');
+    if (loading) loading.remove();
+    data.runs.forEach(r => {
+      const li = document.createElement('li');
+      const short = r.id.length > 20 ? r.id.substring(0,20)+'…' : r.id;
+      const a = document.createElement('a');
+      a.className = 'dropdown-item';
+      a.href = '#';
+      a.dataset.runId = r.id;
+      a.innerHTML = `<i class="bi bi-layers me-2 text-muted"></i>
+        <span class="fw-semibold">${esc(short)}</span>
+        <span class="text-muted small ms-2">${fmtDate(r.started_at)}</span>
+        ${r.grade && r.grade !== 'N/A' ? `<span class="${gradeBadgeClass(r.grade)} ms-1">${esc(r.grade)}</span>` : ''}`;
+      a.addEventListener('click', e => { e.preventDefault(); selectRun(r.id); });
+      li.appendChild(a);
+      menu.appendChild(li);
+    });
+  } catch(e) { /* silent */ }
+}
+
+function selectRun(runId) {
+  currentRunId = runId;
+  const label = document.getElementById('runSelectorLabel');
+  if (runId) {
+    const short = runId.length > 18 ? runId.substring(0,18)+'…' : runId;
+    label.textContent = short;
+  } else {
+    label.textContent = 'Latest Run';
+  }
+  refreshAll();
+}
+
+// ─────────────────────────── Score / Overview ────────────────────────────────
+async function loadScoreAndFindings() {
+  try {
+    const url = currentRunId ? `/api/score?run_id=${encodeURIComponent(currentRunId)}` : '/api/score';
+    const data = await fetchJSON(url);
+    document.getElementById('gradeDisplay').textContent = data.grade || '—';
+    document.getElementById('scoreDisplay').textContent = `Score: ${(data.score||0).toFixed(1)}`;
+    document.getElementById('totalDisplay').textContent = data.totalFindings ?? '—';
+    document.getElementById('generatedAt').textContent = data.generatedAt ? fmtDate(data.generatedAt) : '—';
+
+    const sc = data.severityCounts || {};
+    const sevHtml = ['Critical','High','Medium','Low','Informational'].map(s => {
+      const c = sc[s] || 0;
+      if (!c) return '';
+      return `<div class="d-flex justify-content-between small mb-1">
+        <span class="severity-${s}">${s}</span><span class="fw-bold">${c}</span>
+      </div>`;
+    }).join('');
+    document.getElementById('severityBreakdown').innerHTML = sevHtml || '<span class="text-muted small">No data</span>';
+
+    const cats = data.categoryCounts || {};
+    renderCategoryChart(cats);
+  } catch(e) { console.error('score', e); }
+
+  // Load critical findings
+  try {
+    const url = currentRunId
+      ? `/api/findings?severity=Critical&run_id=${encodeURIComponent(currentRunId)}`
+      : '/api/findings?severity=Critical';
+    const data = await fetchJSON(url);
+    const highUrl = currentRunId
+      ? `/api/findings?severity=High&run_id=${encodeURIComponent(currentRunId)}`
+      : '/api/findings?severity=High';
+    const highData = await fetchJSON(highUrl);
+    const findings = [...(data.findings||[]), ...(highData.findings||[])];
+    document.getElementById('criticalFindings').innerHTML =
+      findings.length ? renderFindingsTable(findings.slice(0,10)) : '<p class="text-muted">No critical or high findings.</p>';
+  } catch(e) { document.getElementById('criticalFindings').innerHTML = '<p class="text-muted">Failed to load findings.</p>'; }
+}
+
+function renderCategoryChart(cats) {
+  const ctx = document.getElementById('categoryChart').getContext('2d');
+  if (_categoryChart) _categoryChart.destroy();
+  const labels = Object.keys(cats);
+  const vals   = Object.values(cats);
+  const colors = ['#e53935','#fb8c00','#fdd835','#43a047','#1e88e5','#8e24aa'];
+  _categoryChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data: vals, backgroundColor: colors }] },
+    options: { plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 10 } } } }, cutout: '60%' }
+  });
+}
+
+// ─────────────────────────── Findings by category ────────────────────────────
+async function loadCategoryFindings(category, elementId) {
+  const el = document.getElementById(elementId);
+  el.innerHTML = '<p class="text-muted p-3">Loading…</p>';
+  try {
+    const base = currentRunId
+      ? `/api/findings?category=${encodeURIComponent(category)}&run_id=${encodeURIComponent(currentRunId)}`
+      : `/api/findings?category=${encodeURIComponent(category)}`;
+    const data = await fetchJSON(base);
+    const findings = data.findings || [];
+    el.innerHTML = findings.length
+      ? `<div class="p-2">${renderFindingsTable(findings)}</div>`
+      : `<p class="text-muted p-3">No ${esc(category)} findings.</p>`;
+  } catch(e) {
+    el.innerHTML = `<p class="text-danger p-3">Error loading findings: ${esc(e.message)}</p>`;
+  }
+}
+
+function renderFindingsTable(findings) {
+  const rows = findings.map(f => `
+    <tr class="finding-row" onclick="showFixGuide('${esc(f.RuleId)}')">
+      <td><span class="${sevBadgeClass(f.Severity)}">${esc(f.Severity)}</span></td>
+      <td><code class="small">${esc(f.RuleId)}</code></td>
+      <td>${esc(f.Title)}</td>
+      <td>${esc(f.Category)}</td>
+      <td>${f.AffectedCount ?? 0}</td>
+      <td><button class="btn btn-outline-primary btn-sm" onclick="event.stopPropagation();showFixGuide('${esc(f.RuleId)}')">
+        <i class="bi bi-tools me-1"></i>Fix Guide</button></td>
+    </tr>`).join('');
+  return `<div class="table-responsive"><table class="table table-hover table-sm mb-0">
+    <thead class="table-light"><tr><th>Severity</th><th>Rule ID</th><th>Title</th><th>Category</th><th>Affected</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+// ─────────────────────────── Fix Guide Modal ─────────────────────────────────
+async function showFixGuide(ruleId) {
+  const body = document.getElementById('fixGuideBody');
+  body.innerHTML = '<div class="text-center py-4"><div class="spinner-border text-primary"></div></div>';
+  new bootstrap.Modal(document.getElementById('fixGuideModal')).show();
+  try {
+    const d = await fetchJSON(`/api/fix-guide/${encodeURIComponent(ruleId)}`);
+    body.innerHTML = `
+      <div class="d-flex gap-2 mb-3">
+        <span class="${sevBadgeClass(d.severity)}">${esc(d.severity)}</span>
+        <code>${esc(d.ruleId)}</code>
+        ${d.cisControl ? `<span class="badge bg-light text-dark border">CIS ${esc(d.cisControl)}</span>` : ''}
+        ${d.nistControl ? `<span class="badge bg-light text-dark border">NIST ${esc(d.nistControl)}</span>` : ''}
+      </div>
+      <h5>${esc(d.title)}</h5>
+      <p class="text-muted small">${esc(d.whyItMatters)}</p>
+      ${d.affectedCount ? `<p><strong>Affected Objects (${d.affectedCount}):</strong> ${(d.affectedObjects||[]).slice(0,5).map(esc).join(', ')}${d.affectedCount>5?'…':''}</p>` : ''}
+      <h6 class="mt-3"><i class="bi bi-wrench me-1"></i>Remediation</h6>
+      <p class="small">${esc(d.remediationSteps)}</p>
+      <h6 class="mt-3"><i class="bi bi-terminal me-1"></i>Verification Command</h6>
+      <pre class="bg-light p-2 rounded small">${esc(d.verificationCommand)}</pre>
+      ${d.mitreAttack ? `<div class="alert alert-secondary py-2 small mt-2"><i class="bi bi-crosshair me-1"></i><strong>MITRE ATT&CK:</strong> ${esc(d.mitreAttack)}</div>` : ''}
+    `;
+  } catch(e) { body.innerHTML = `<p class="text-danger">Failed to load fix guide: ${esc(e.message)}</p>`; }
+}
+
+// ─────────────────────────── Compliance ──────────────────────────────────────
+async function loadCompliance() {
+  const el = document.getElementById('complianceContent');
+  el.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>';
+  try {
+    const data = await fetchJSON('/api/compliance');
+    const frameworks = data.frameworks || {};
+    const parts = Object.entries(frameworks).map(([fw, info]) => {
+      const pct = info.score || 0;
+      const barClass = pct >= 80 ? 'bg-success' : pct >= 60 ? 'bg-warning' : 'bg-danger';
+      const findings = (info.findings || []).map(f => `
+        <tr><td><span class="${sevBadgeClass(f.Severity)}">${esc(f.Severity)}</span></td>
+            <td>${esc(f.Title)}</td>
+            <td><button class="btn btn-outline-primary btn-sm" onclick="showFixGuide('${esc(f.RuleId)}')">Fix</button></td>
+        </tr>`).join('');
+      return `<div class="card mb-3">
+        <div class="card-header fw-bold">${esc(fw)}
+          <span class="float-end text-muted small">${pct.toFixed(0)}% compliant</span>
+        </div>
+        <div class="card-body">
+          <div class="progress mb-3" style="height:10px">
+            <div class="progress-bar ${barClass}" style="width:${pct}%"></div>
+          </div>
+          ${findings ? `<div class="table-responsive"><table class="table table-sm mb-0">
+            <thead class="table-light"><tr><th>Severity</th><th>Finding</th><th></th></tr></thead>
+            <tbody>${findings}</tbody></table></div>` : '<p class="text-success mb-0"><i class="bi bi-check-circle me-1"></i>Fully compliant</p>'}
+        </div>
+      </div>`;
+    }).join('');
+    el.innerHTML = parts || '<p class="text-muted p-3">No compliance data.</p>';
+  } catch(e) { el.innerHTML = `<p class="text-danger p-3">Error: ${esc(e.message)}</p>`; }
+}
+
+// ─────────────────────────── Attack Paths ────────────────────────────────────
+async function loadAttackPaths() {
+  const el = document.getElementById('attackPathsContent');
+  el.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>';
+  try {
+    const data = await fetchJSON('/api/attack-paths');
+    if (!data.paths || !data.paths.length) {
+      el.innerHTML = '<p class="text-success p-3"><i class="bi bi-shield-check me-2"></i>No exploitable attack paths detected.</p>';
+      return;
+    }
+    const rows = data.paths.map(p => `
+      <div class="card mb-2">
+        <div class="card-body py-2">
+          <span class="${sevBadgeClass(p.severity)} me-2">${esc(p.severity)}</span>
+          <strong>${esc(p.path)}</strong>
+          <div class="text-muted small mt-1">${esc(p.description||'')}</div>
+        </div>
+      </div>`).join('');
+    el.innerHTML = rows;
+  } catch(e) { el.innerHTML = `<p class="text-danger p-3">Error: ${esc(e.message)}</p>`; }
+}
+
+// ─────────────────────────── Drift Analysis ──────────────────────────────────
+async function loadDrift() {
+  const el = document.getElementById('driftContent');
+  el.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>';
+  try {
+    const data = await fetchJSON('/api/drift');
+    const d = data.drift || {};
+    el.innerHTML = `
+      <div class="row g-3 mb-3">
+        <div class="col-md-6"><div class="card p-3">
+          <div class="text-muted small">Baseline</div>
+          <strong>${esc(data.baseline?.file||'—')}</strong>
+          <div class="small text-muted">${fmtDate(data.baseline?.generatedAt)} · Grade ${esc(data.baseline?.grade||'—')}</div>
+        </div></div>
+        <div class="col-md-6"><div class="card p-3">
+          <div class="text-muted small">Current</div>
+          <strong>${esc(data.current?.file||'—')}</strong>
+          <div class="small text-muted">${fmtDate(data.current?.generatedAt)} · Grade ${esc(data.current?.grade||'—')}</div>
+        </div></div>
+      </div>
+      <div class="row g-3 mb-3 text-center">
+        <div class="col-4"><div class="card p-3">
+          <div class="fs-2 fw-bold text-danger">${d.newCount||0}</div>
+          <div class="small text-muted">New Findings</div>
+        </div></div>
+        <div class="col-4"><div class="card p-3">
+          <div class="fs-2 fw-bold text-success">${d.resolvedCount||0}</div>
+          <div class="small text-muted">Resolved</div>
+        </div></div>
+        <div class="col-4"><div class="card p-3">
+          <div class="fs-2 fw-bold ${(d.scoreDelta||0)>=0?'text-success':'text-danger'}">${((d.scoreDelta||0)>=0?'+':'') + (d.scoreDelta||0).toFixed(1)}</div>
+          <div class="small text-muted">Score Delta</div>
+        </div></div>
+      </div>
+      ${(d.newFindings||[]).length ? `<div class="card mb-3">
+        <div class="card-header text-danger fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>New Findings</div>
+        <div class="card-body p-0">${renderFindingsTable(d.newFindings)}</div>
+      </div>` : ''}
+      ${(d.resolvedFindings||[]).length ? `<div class="card mb-3">
+        <div class="card-header text-success fw-bold"><i class="bi bi-check-circle me-2"></i>Resolved Findings</div>
+        <div class="card-body p-0">${renderFindingsTable(d.resolvedFindings)}</div>
+      </div>` : ''}
+    `;
+  } catch(e) {
+    el.innerHTML = `<div class="alert alert-info m-3">${esc(e.message||'Need at least 2 assessments for drift comparison.')}</div>`;
+  }
+}
+
+// ─────────────────────────── Red Team Page ───────────────────────────────────
+async function loadRedTeamPage() {
+  try {
+    // Load technique catalog
+    const catalogData = await fetchJSON('/api/attack-techniques');
+    const techniques = catalogData.techniques || [];
+
+    // Load red team simulation results (if any)
+    let rtResults = [];
+    try {
+      const rtData = await fetchJSON('/api/redteam');
+      rtResults = rtData.results || [];
+    } catch(e) { /* no red team results yet */ }
+
+    // Show active banner if red team findings exist
+    const banner = document.getElementById('redteam-active-banner');
+    if (rtResults.length > 0 && banner) {
+      banner.classList.remove('d-none');
+    }
+
+    // Severity badge helper
+    const sevBadge = sev => {
+      const cls = sev === 'Critical' ? 'danger' : sev === 'High' ? 'warning' :
+                  sev === 'Medium' ? 'info' : 'secondary';
+      return `<span class="badge bg-${cls}">${esc(sev)}</span>`;
+    };
+
+    // Status from current run findings
+    const allFindings = [];
+    try {
+      const fData = await fetchJSON('/api/findings');
+      (fData.findings || []).forEach(f => allFindings.push(f));
+    } catch(e) {}
+
+    const detectedRuleIds = new Set(allFindings.map(f => f.rule_id));
+
+    // Build technique table
+    const tbody = document.getElementById('attackTechniquesBody');
+    if (tbody) {
+      tbody.innerHTML = techniques.map(t => {
+        const found = detectedRuleIds.has(t.ruleId);
+        const status = found
+          ? `<span class="badge bg-danger"><i class="bi bi-exclamation-circle me-1"></i>Detected</span>`
+          : `<span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Clean</span>`;
+        return `<tr style="cursor:pointer" onclick='showAttackTechniqueDetail(this.dataset.json)' data-json='${esc(JSON.stringify(t))}'>
+          <td class="small fw-semibold">${esc(t.name)}</td>
+          <td><code class="small">${esc(t.id)}</code></td>
+          <td>${sevBadge(t.severity)}</td>
+          <td>${status}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Build simulation list
+    const simList = document.getElementById('redteam-simulation-list');
+    if (simList) {
+      const simTechs = [
+        { name: 'Kerberoasting', fn: 'Invoke-RedTeamKerberoast', mitre: 'T1558.003', risk: 'Critical' },
+        { name: 'AS-REP Roasting', fn: 'Invoke-RedTeamASREPRoast', mitre: 'T1558.004', risk: 'High' },
+        { name: 'Password Spraying', fn: 'Invoke-RedTeamPasswordSpray', mitre: 'T1110.003', risk: 'High' },
+        { name: 'MachineAccountQuota', fn: 'Invoke-RedTeamMachineAccountQuota', mitre: 'T1136.001', risk: 'High' },
+        { name: 'Unconstrained Delegation', fn: 'Invoke-RedTeamUnconstrainedDelegation', mitre: 'T1558', risk: 'Critical' },
+        { name: 'GPP/cPassword', fn: 'Invoke-RedTeamGPPCPassword', mitre: 'T1552.006', risk: 'Critical' },
+        { name: 'AD CS (ESC1-8)', fn: 'Invoke-RedTeamADCS', mitre: 'T1649', risk: 'Critical' },
+        { name: 'Golden Certificate', fn: 'Invoke-RedTeamGoldenCertificate', mitre: 'T1649', risk: 'Critical' },
+        { name: 'DCSync', fn: 'Invoke-RedTeamDCSync', mitre: 'T1003.006', risk: 'Critical' },
+        { name: 'NTDS.dit Dump', fn: 'Invoke-RedTeamNtdsDit', mitre: 'T1003.003', risk: 'Critical' },
+        { name: 'Golden Ticket', fn: 'Invoke-RedTeamGoldenTicket', mitre: 'T1558.001', risk: 'Critical' },
+        { name: 'Silver Ticket', fn: 'Invoke-RedTeamSilverTicket', mitre: 'T1558.002', risk: 'High' },
+        { name: 'Golden SAML', fn: 'Invoke-RedTeamGoldenSAML', mitre: 'T1606.002', risk: 'Critical' },
+        { name: 'Entra Connect', fn: 'Invoke-RedTeamEntraConnect', mitre: 'T1098.001', risk: 'Critical' },
+        { name: 'Trust Bypass', fn: 'Invoke-RedTeamTrustBypass', mitre: 'T1134.005', risk: 'High' },
+        { name: 'SID History', fn: 'Invoke-RedTeamSIDHistory', mitre: 'T1134.005', risk: 'Critical' },
+        { name: 'Skeleton Key', fn: 'Invoke-RedTeamSkeletonKey', mitre: 'T1556.001', risk: 'Critical' },
+        { name: 'Pass the Hash', fn: 'Invoke-RedTeamPassTheHash', mitre: 'T1550.002', risk: 'High' },
+        { name: 'Pass the Ticket', fn: 'Invoke-RedTeamPassTheTicket', mitre: 'T1550.003', risk: 'High' },
+        { name: 'DCShadow', fn: 'Invoke-RedTeamDCShadow', mitre: 'T1207', risk: 'Critical' },
+        { name: 'Credential Dumping (LSASS/NTDS/WDigest)', fn: 'Invoke-RedTeamCredentialDumping', mitre: 'T1003', risk: 'Critical' },
+        { name: 'Lateral Movement Path Abuse', fn: 'Invoke-RedTeamLateralMovement', mitre: 'T1021', risk: 'Critical' },
+      ];
+      const riskBadge = r => {
+        const cls = r === 'Critical' ? 'danger' : r === 'High' ? 'warning' : 'info';
+        return `<span class="badge bg-${cls} ms-1">${esc(r)}</span>`;
+      };
+      simList.innerHTML = `<div class="list-group list-group-flush">` +
+        simTechs.map(t => {
+          const hasResult = rtResults.some(r => r.title && r.title.includes(t.name));
+          return `<div class="list-group-item d-flex justify-content-between align-items-center px-2 py-2">
+            <span class="small fw-semibold">${esc(t.name)} <code class="text-muted">${esc(t.id)}</code>${riskBadge(t.risk)}</span>
+            <button class="btn btn-sm btn-outline-danger" onclick='showSimPreview(this.dataset.json)' data-json='${esc(JSON.stringify(t))}'>
+              <i class="bi bi-play-circle me-1"></i>${hasResult ? 'Results' : 'Preview'}
+            </button>
+          </div>`;
+        }).join('') + `</div>`;
+    }
+  } catch(e) {
+    console.error('Red Team page error:', e);
+  }
+}
+
+function showAttackTechniqueDetail(el) {
+  const jsonStr = (typeof el === 'string') ? el : el.dataset.json;
+  const t = JSON.parse(jsonStr);
+  const panel = document.getElementById('redteam-detail-panel');
+  const title = document.getElementById('redteam-detail-title');
+  const body  = document.getElementById('redteam-detail-body');
+  if (!panel || !title || !body) return;
+  title.textContent = t.name + ' (' + t.id + ')';
+  body.innerHTML = `
+    <p class="mb-2"><strong>Description:</strong> ${esc(t.description)}</p>
+    <p class="mb-2"><strong>Detection Events:</strong> ${(t.detectionEvents||[]).map(e => `<code>${esc(e)}</code>`).join(', ')}</p>
+    <p class="mb-0"><strong>Mitigations:</strong></p>
+    <ul class="mb-0 small">${(t.mitigations||[]).map(m => `<li>${esc(m)}</li>`).join('')}</ul>
+  `;
+  panel.classList.remove('d-none');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function showSimPreview(el) {
+  const jsonStr = (typeof el === 'string') ? el : el.dataset.json;
+  const t = JSON.parse(jsonStr);
+  const panel = document.getElementById('redteam-detail-panel');
+  const title = document.getElementById('redteam-detail-title');
+  const body  = document.getElementById('redteam-detail-body');
+  if (!panel || !title || !body) return;
+  title.innerHTML = `<span class="badge bg-danger me-2">RED TEAM</span> ${esc(t.name)} Simulation Preview`;
+  body.innerHTML = `
+    <div class="alert alert-warning mb-3">
+      <i class="bi bi-info-circle me-2"></i>
+      <strong>Safe Mode Preview</strong> — This shows what the simulation <em>would</em> target.
+      Active mode requires <code>-SafeMode:$false</code>.
+    </div>
+    <p><strong>PowerShell Function:</strong> <code>${esc(t.fn)}</code></p>
+    <p><strong>MITRE ATT&CK:</strong> <a href="https://attack.mitre.org/techniques/${esc(t.id.replace(/\./g, '/'))}/" target="_blank" rel="noopener">${esc(t.id)}</a></p>
+    <p><strong>Risk Level:</strong> <span class="badge bg-danger">${esc(t.risk)}</span></p>
+    <p class="mb-0 small text-muted">Run <code>Invoke-ADWall.ps1 -RedTeam -SafeMode:$false</code> to collect full simulation results.</p>
+  `;
+  panel.classList.remove('d-none');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// ─────────────────────────── Run Form ────────────────────────────────────────
+function getFormParams() {
+  const modules = ['Identity','Config','Exploit','Persistence','Detection','Compliance']
+    .filter(m => document.getElementById('m-'+m)?.checked);
+  const formats = ['HTML','JSON','CSV','Markdown','CEF','Splunk']
+    .filter(f => document.getElementById('fmt-'+f)?.checked);
+  return {
+    domainController: document.getElementById('f-dc')?.value.trim(),
+    orgName: document.getElementById('f-orgName')?.value.trim(),
+    outputPath: document.getElementById('f-outputPath')?.value.trim(),
+    mode: document.getElementById('f-mode')?.value,
+    staleAccountDays: parseInt(document.getElementById('f-staleAccountDays')?.value)||90,
+    modules,
+    format: formats,
+    safeMode: document.getElementById('f-safeMode')?.checked,
+    redTeam: document.getElementById('f-redTeam')?.checked,
+    siemExport: document.getElementById('f-siemExport')?.checked,
+    jiraUrl: document.getElementById('f-jiraUrl')?.value.trim(),
+    jiraProject: document.getElementById('f-jiraProject')?.value.trim(),
+    jiraUser: document.getElementById('f-jiraUser')?.value.trim(),
+    serviceNowUrl: document.getElementById('f-snUrl')?.value.trim(),
+    serviceNowUser: document.getElementById('f-snUser')?.value.trim(),
+    alertEmail: document.getElementById('f-alertEmail')?.value.trim(),
+    alertSmtpServer: document.getElementById('f-smtpServer')?.value.trim(),
+    alertSmtpPort: parseInt(document.getElementById('f-smtpPort')?.value)||587,
+    alertOnDrift: document.getElementById('f-alertOnDrift')?.checked,
+  };
+}
+
+function buildCommand() {
+  const p = getFormParams();
+  const pwsh = window._pwsh || 'pwsh';
+  let cmd = `${pwsh} -NonInteractive -NoProfile -ExecutionPolicy Bypass -File ./Invoke-ADWall.ps1`;
+  if (p.domainController) cmd += ` -DomainController ${p.domainController}`;
+  if (p.mode) cmd += ` -Mode ${p.mode}`;
+  if (p.orgName) cmd += ` -OrgName "${p.orgName}"`;
+  if (p.outputPath && p.outputPath !== './output') cmd += ` -OutputPath "${p.outputPath}"`;
+  if (p.staleAccountDays !== 90) cmd += ` -StaleAccountDays ${p.staleAccountDays}`;
+  if (p.modules.length) cmd += ` -Modules ${p.modules.join(',')}`;
+  if (p.format.length) cmd += ` -Format ${p.format.join(',')}`;
+  if (p.redTeam) cmd += ' -RedTeam';
+  if (!p.safeMode) cmd += ' -SafeMode $false';
+  if (p.siemExport) cmd += ' -SIEMExport';
+  if (p.jiraUrl) cmd += ` -JiraUrl "${p.jiraUrl}"`;
+  if (p.jiraProject) cmd += ` -JiraProject "${p.jiraProject}"`;
+  if (p.jiraUser) cmd += ` -JiraUser "${p.jiraUser}"`;
+  if (p.serviceNowUrl) cmd += ` -ServiceNowUrl "${p.serviceNowUrl}"`;
+  if (p.serviceNowUser) cmd += ` -ServiceNowUser "${p.serviceNowUser}"`;
+  if (p.alertEmail) cmd += ` -AlertEmail "${p.alertEmail}"`;
+  if (p.alertSmtpServer) cmd += ` -AlertSmtpServer "${p.alertSmtpServer}"`;
+  if (p.alertSmtpPort && p.alertSmtpPort !== 587) cmd += ` -AlertSmtpPort ${p.alertSmtpPort}`;
+  if (p.alertOnDrift) cmd += ' -AlertOnDrift';
+  return cmd;
+}
+
+function updateCommand() {
+  const el = document.getElementById('cmdPreview');
+  if (el) el.textContent = buildCommand();
+}
+
+function copyCommand() {
+  navigator.clipboard.writeText(buildCommand()).then(() => {
+    const btn = document.querySelector('[onclick="copyCommand()"]');
+    if (btn) { btn.innerHTML = '<i class="bi bi-check"></i> Copied!'; setTimeout(() => btn.innerHTML = '<i class="bi bi-clipboard"></i> Copy', 2000); }
+  });
+}
+
+function toggleAlertingCard() {
+  const card = document.getElementById('alertingCard');
+  const mode = document.getElementById('f-mode')?.value;
+  if (card) card.style.setProperty('display', mode === 'Monitoring' ? 'block' : 'none', 'important');
+}
+
+function toggleRedTeamWarning() {
+  const warn = document.getElementById('redTeamWarning');
+  if (warn) warn.classList.toggle('d-none', !document.getElementById('f-redTeam')?.checked);
+}
+
+async function startRun() {
+  const params = getFormParams();
+  if (!params.domainController) {
+    alert('Domain Controller is required.');
+    return;
+  }
+  const runBtn = document.getElementById('runBtn');
+  runBtn.disabled = true;
+  runBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Starting…';
+
+  const logSection = document.getElementById('runLogSection');
+  const termLog = document.getElementById('terminalLog');
+  logSection.style.display = 'block';
+  termLog.innerHTML = '';
+  _lastLogId = 0;
+
+  try {
+    const resp = await fetch('/api/run/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(params),
+    });
+    const data = await resp.json();
+    _activeRunId = data.run_id;
+    document.getElementById('activeRunId').textContent = data.run_id || '';
+    document.getElementById('runStatusBadge').textContent = data.status || 'running';
+
+    if (data.status === 'preview') {
+      termLog.innerHTML = `<span class="log-WARNING">[PREVIEW] PowerShell not available on this host.\n${esc(data.message)}\n\nCommand that would run:\n${esc(data.command)}</span>`;
+      runBtn.disabled = false;
+      runBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Run Assessment';
+      return;
+    }
+
+    // Start polling logs
+    _pollTimer = setInterval(() => pollLogs(data.run_id), 2000);
+  } catch(e) {
+    termLog.innerHTML = `<span class="log-ERROR">Error: ${esc(e.message)}</span>`;
+    runBtn.disabled = false;
+    runBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Run Assessment';
+  }
+}
+
+async function pollLogs(runId) {
+  try {
+    const data = await fetchJSON(`/api/run/${encodeURIComponent(runId)}/logs?since_id=${_lastLogId}`);
+    const termLog = document.getElementById('terminalLog');
+    (data.logs || []).forEach(log => {
+      _lastLogId = Math.max(_lastLogId, log.id);
+      const span = document.createElement('span');
+      span.className = 'log-' + (log.level || 'INFO');
+      span.textContent = `[${log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : ''}] ${log.message}\n`;
+      termLog.appendChild(span);
+    });
+    termLog.scrollTop = termLog.scrollHeight;
+
+    // Check status
+    const status = await fetchJSON(`/api/run/${encodeURIComponent(runId)}/status`);
+    document.getElementById('runStatusBadge').textContent = status.status;
+    if (status.status === 'completed' || status.status === 'failed') {
+      clearInterval(_pollTimer);
+      _pollTimer = null;
+      const runBtn = document.getElementById('runBtn');
+      runBtn.disabled = false;
+      runBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Run Assessment';
+      document.getElementById('viewResultsFooter').classList.remove('d-none');
+      if (status.status === 'completed') {
+        populateRunSelector();
+      }
+    }
+  } catch(e) { /* silent poll failure */ }
+}
+
+function viewRunResults() {
+  if (_activeRunId) selectRun(_activeRunId);
+  document.querySelector('[data-page="overview"]').click();
+}
+
+// ─────────────────────────── Run History ─────────────────────────────────────
+async function loadHistory() {
+  const tbody = document.getElementById('historyTableBody');
+  tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">Loading…</td></tr>';
+  try {
+    const data = await fetchJSON('/api/runs');
+    if (!data.runs.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">No runs yet. Use the Run Assessment page to start one.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.runs.map(r => {
+      const short = r.id.length > 22 ? r.id.substring(0,22)+'…' : r.id;
+      return `<tr class="history-row" data-run-id="${esc(r.id)}" style="cursor:pointer">
+        <td><code class="small">${esc(short)}</code></td>
+        <td class="small">${fmtDate(r.started_at)}</td>
+        <td>${esc(r.mode||'—')}</td>
+        <td>${esc(r.domain_controller||'—')}</td>
+        <td>${statusBadge(r.status)}</td>
+        <td>${r.grade && r.grade !== 'N/A' ? `<span class="${gradeBadgeClass(r.grade)}">${esc(r.grade)}</span>` : '—'}</td>
+        <td>${r.total_findings ?? '—'}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-primary me-1 btn-view-run" data-run-id="${esc(r.id)}">
+            <i class="bi bi-bar-chart"></i> View</button>
+          <button class="btn btn-sm btn-outline-secondary btn-show-logs" data-run-id="${esc(r.id)}">
+            <i class="bi bi-terminal"></i> Logs</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="8" class="text-danger text-center py-3">Error: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function openLogsModal(runId) {
+  document.getElementById('logsModalRunId').textContent = runId;
+  const body = document.getElementById('logsModalBody');
+  body.innerHTML = 'Loading…';
+  new bootstrap.Modal(document.getElementById('logsModal')).show();
+  try {
+    const data = await fetchJSON(`/api/run/${encodeURIComponent(runId)}/logs`);
+    if (!data.logs.length) { body.innerHTML = '<span class="text-muted">No logs for this run.</span>'; return; }
+    body.innerHTML = '';
+    data.logs.forEach(log => {
+      const span = document.createElement('span');
+      span.className = 'log-' + (log.level || 'INFO');
+      span.textContent = `[${log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : ''}] ${log.message}\n`;
+      body.appendChild(span);
+    });
+    body.scrollTop = body.scrollHeight;
+  } catch(e) { body.innerHTML = `<span class="log-ERROR">Error: ${esc(e.message)}</span>`; }
+}
+
+// ─────────────────────────── Reports ─────────────────────────────────────────
+async function loadReports() {
+  const tbody = document.getElementById('reportsTableBody');
+  tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">Loading…</td></tr>';
+  try {
+    const data = await fetchJSON('/api/reports');
+    if (!data.reports.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4">No reports found. Run an assessment with HTML/CSV output to generate reports.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.reports.map(r => {
+      const fmtColor = {HTML:'primary',JSON:'secondary',CSV:'success',Markdown:'info',CEF:'warning',Splunk:'danger'};
+      const fmtBadge = `<span class="badge bg-${fmtColor[r.format]||'secondary'}">${esc(r.format||'?')}</span>`;
+      const shortId = (r.run_id||'').length > 20 ? r.run_id.substring(0,20)+'…' : (r.run_id||'—');
+      const previewBtn = (r.format === 'HTML')
+        ? `<button class="btn btn-sm btn-outline-info me-1 btn-preview-report" data-filename="${esc(r.filename)}"><i class="bi bi-eye"></i> Preview</button>`
+        : '';
+      return `<tr>
+        <td><code class="small">${esc(shortId)}</code></td>
+        <td class="small">${fmtDate(r.generated_at)}</td>
+        <td>${fmtBadge}</td>
+        <td class="small">${esc(r.filename)}</td>
+        <td class="small">${fmtSize(r.file_size)}</td>
+        <td>
+          ${previewBtn}
+          <a class="btn btn-sm btn-outline-primary btn-dl-report" data-filename="${esc(r.filename)}" href="#">
+            <i class="bi bi-download"></i> Download</a>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="text-danger text-center py-3">Error: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function previewReport(filename) {
+  document.getElementById('reportPreviewFrame').src = `/api/report/${encodeURIComponent(filename)}`;
+  new bootstrap.Modal(document.getElementById('reportPreviewModal')).show();
+}
+
+// ─────────────────────────── Refresh all ─────────────────────────────────────
+function refreshAll() {
+  const activePage = document.querySelector('.page-section.active');
+  if (!activePage) return;
+  onPageActivate(activePage.id.replace('page-', ''));
+}
+
+// ─────────────────────────── Init ────────────────────────────────────────────
+(async function init() {
+  // Fetch server info to get correct pwsh binary name
+  try {
+    const info = await fetchJSON('/api/info');
+    if (info.pwsh) window._pwsh = info.pwsh;
+  } catch(e) { window._pwsh = 'pwsh'; }
+
+  // Wire report table buttons via event delegation (avoids onclick-in-string XSS)
+  document.getElementById('reportsTableBody').addEventListener('click', e => {
+    const previewBtn = e.target.closest('.btn-preview-report');
+    const dlBtn = e.target.closest('.btn-dl-report');
+    if (previewBtn) {
+      e.preventDefault();
+      previewReport(previewBtn.dataset.filename);
+    }
+    if (dlBtn) {
+      e.preventDefault();
+      const fn = dlBtn.dataset.filename;
+      const a = document.createElement('a');
+      a.href = '/api/report/' + encodeURIComponent(fn);
+      a.download = fn;
+      a.click();
+    }
+  });
+
+  // Wire history table via event delegation (avoids onclick-in-string XSS)
+  document.getElementById('historyTableBody').addEventListener('click', e => {
+    const viewBtn  = e.target.closest('.btn-view-run');
+    const logsBtn  = e.target.closest('.btn-show-logs');
+    const row      = e.target.closest('.history-row');
+    if (viewBtn) {
+      e.stopPropagation();
+      selectRun(viewBtn.dataset.runId);
+      document.querySelector('[data-page="overview"]').click();
+    } else if (logsBtn) {
+      e.stopPropagation();
+      openLogsModal(logsBtn.dataset.runId);
+    } else if (row) {
+      selectRun(row.dataset.runId);
+      document.querySelector('[data-page="overview"]').click();
+    }
+  });
+
+  await populateRunSelector();
+  loadScoreAndFindings();
+  updateCommand();
+})();
+</script>
+</body>
+</html>
