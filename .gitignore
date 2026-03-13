@@ -1,0 +1,41 @@
+# Python / dashboard
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# AD-Wall output
+output/
+*.html
+*.csv
+!src/dashboard/templates/*.html
+
+# Config / secrets
+adwall.config.json
+*.pfx
+*.pem
+*.key
+
+# PowerShell
+*.ps1xml
+*.psd1.bak
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Logs
+*.log

@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AD-Wall Dashboard</title>
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Bootstrap Icons -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --sidebar-width: 230px;
+      --primary: #1a237e;
+      --primary-light: #3949ab;
+    }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f4f6fb; }
+    /* Sidebar */
+    #sidebar {
+      position: fixed; top: 0; left: 0; height: 100vh;
+      width: var(--sidebar-width); background: var(--primary); color: #fff;
+      display: flex; flex-direction: column; z-index: 200; transition: width 0.2s;
+    }
+    #sidebar .brand { padding: 22px 20px 18px; font-size: 1.2em; font-weight: 700;
+      border-bottom: 1px solid rgba(255,255,255,0.1); letter-spacing: 0.04em; }
+    #sidebar .brand span { color: #90caf9; }
+    #sidebar nav a {
+      display: flex; align-items: center; gap: 10px; padding: 12px 20px;
+      color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.9em;
+      transition: background 0.15s; border-radius: 0;
+    }
+    #sidebar nav a:hover, #sidebar nav a.active {
+      background: rgba(255,255,255,0.12); color: #fff;
+    }
+    #sidebar nav a i { font-size: 1.1em; width: 20px; text-align: center; }
+    #sidebar .sidebar-footer { margin-top: auto; padding: 12px 20px;
+      font-size: 0.75em; opacity: 0.6; border-top: 1px solid rgba(255,255,255,0.1); }
+    /* Main */
+    #main { margin-left: var(--sidebar-width); min-height: 100vh; }
+    .topbar { background: #fff; padding: 12px 28px; display: flex; align-items: center;
+      justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      position: sticky; top: 0; z-index: 100; }
+    .topbar h2 { font-size: 1.15em; font-weight: 600; color: var(--primary); margin: 0; }
+    .content { padding: 24px 28px; }
+    /* Score card */
+    .score-circle {
+      width: 100px; height: 100px; border-radius: 50%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      border: 6px solid #ccc; font-weight: 700;
+    }
+    .score-circle .grade-letter { font-size: 2.2em; line-height: 1; }
+    .score-circle .score-num   { font-size: 0.8em; color: #666; }
+    /* Severity badges */
+    .badge-critical      { background: #d32f2f !important; }
+    .badge-high          { background: #f57c00 !important; }
+    .badge-medium        { background: #fbc02d !important; color: #212121 !important; }
+    .badge-low           { background: #388e3c !important; }
+    .badge-informational { background: #1976d2 !important; }
+    /* Finding cards */
+    .finding-row { cursor: pointer; }
+    .finding-row:hover { background: #f0f4ff !important; }
+    .finding-detail { display: none; background: #f9fafb; }
+    .finding-detail.show { display: table-row; }
+    /* Chart container */
+    .chart-wrap { position: relative; height: 220px; }
+    /* Drift cards */
+    .drift-new      { border-left: 4px solid #d32f2f; }
+    .drift-resolved { border-left: 4px solid #388e3c; }
+    .drift-persist  { border-left: 4px solid #f57c00; }
+    /* Stat cards */
+    .stat-card { border-radius: 10px; padding: 18px 20px; color: #fff; flex: 1; min-width: 130px; }
+    /* Spinner overlay */
+    #loading { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.25);
+      z-index: 9999; align-items: center; justify-content: center; }
+    /* Page sections */
+    .page-section { display: none; }
+    .page-section.active { display: block; }
+    /* Responsive */
+    @media(max-width: 768px) {
+      #sidebar { width: 60px; }
+      #sidebar .brand span, #sidebar nav a span, #sidebar .sidebar-footer { display: none; }
+      #main { margin-left: 60px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Loading spinner -->
+<div id="loading" style="display:none">
+  <div class="spinner-border text-light" role="status" style="width:3rem;height:3rem"><span class="visually-hidden">Loading...</span></div>
+</div>
+
+<!-- Sidebar -->
+<div id="sidebar">
+  <div class="brand">&#128737; AD-<span>Wall</span></div>
+  <nav class="mt-2">
+    <a href="#" class="active" data-page="overview">
+      <i class="bi bi-speedometer2"></i><span>Overview</span></a>
+    <a href="#" data-page="identity">
+      <i class="bi bi-person-lock"></i><span>Identity &amp; Privilege</span></a>
+    <a href="#" data-page="config">
+      <i class="bi bi-shield-lock"></i><span>Config &amp; GPO</span></a>
+    <a href="#" data-page="exploits">
+      <i class="bi bi-bug"></i><span>Exploits &amp; Vulns</span></a>
+    <a href="#" data-page="persistence">
+      <i class="bi bi-eye-slash"></i><span>Persistence</span></a>
+    <a href="#" data-page="drift">
+      <i class="bi bi-graph-up-arrow"></i><span>Drift Analysis</span></a>
+  </nav>
+  <div class="sidebar-footer">AD-Wall v1.0.0</div>
+</div>
+
+<!-- Main area -->
+<div id="main">
+  <div class="topbar">
+    <h2 id="pageTitle">Overview</h2>
+    <div class="d-flex gap-2 align-items-center">
+      <small class="text-muted" id="lastUpdated"></small>
+      <button class="btn btn-sm btn-outline-secondary" onclick="refreshData()">
+        <i class="bi bi-arrow-clockwise"></i> Refresh</button>
+      <a href="/api/export" class="btn btn-sm btn-outline-primary">
+        <i class="bi bi-download"></i> Export CSV</a>
+    </div>
+  </div>
+
+  <div class="content">
+
+    <!-- No data notice -->
+    {% if not has_data %}
+    <div class="alert alert-warning d-flex align-items-center gap-3">
+      <i class="bi bi-exclamation-triangle-fill fs-4"></i>
+      <div>
+        <strong>No assessment data found.</strong>
+        Run <code>Invoke-ADWall.ps1</code> to generate assessment data, then refresh this page.
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- ====== OVERVIEW ====== -->
+    <div id="page-overview" class="page-section active">
+      <div class="row g-3 mb-4" id="statCards">
+        <!-- filled by JS -->
+      </div>
+
+      <div class="row g-3 mb-4">
+        <div class="col-md-4">
+          <div class="card h-100 shadow-sm">
+            <div class="card-body text-center">
+              <h6 class="text-muted mb-3">Overall Security Posture</h6>
+              <div class="d-flex justify-content-center mb-3">
+                <div class="score-circle" id="scoreCircle">
+                  <span class="grade-letter" id="gradeDisplay">—</span>
+                  <span class="score-num" id="scoreDisplay">—/100</span>
+                </div>
+              </div>
+              <p class="text-muted small" id="gradeDescription"></p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100 shadow-sm">
+            <div class="card-body">
+              <h6 class="text-muted mb-2">Severity Distribution</h6>
+              <div class="chart-wrap"><canvas id="severityChart"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100 shadow-sm">
+            <div class="card-body">
+              <h6 class="text-muted mb-2">Findings by Category</h6>
+              <div class="chart-wrap"><canvas id="categoryChart"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top Critical/High findings table -->
+      <div class="card shadow-sm">
+        <div class="card-header bg-danger text-white fw-bold">
+          <i class="bi bi-exclamation-octagon-fill"></i> Critical &amp; High Priority Findings
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover mb-0" id="topFindingsTable">
+              <thead class="table-light">
+                <tr><th>ID</th><th>Severity</th><th>Category</th><th>Title</th><th>Affected</th></tr>
+              </thead>
+              <tbody id="topFindingsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====== CATEGORY PAGES (Identity, Config, Exploits, Persistence) ====== -->
+    <div id="page-identity"   class="page-section"><div id="findingsIdentity"></div></div>
+    <div id="page-config"     class="page-section"><div id="findingsConfig"></div></div>
+    <div id="page-exploits"   class="page-section"><div id="findingsExploits"></div></div>
+    <div id="page-persistence" class="page-section"><div id="findingsPersistence"></div></div>
+
+    <!-- ====== DRIFT ANALYSIS ====== -->
+    <div id="page-drift" class="page-section">
+      <div id="driftContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>
+          Loading drift data…
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /main -->
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let allFindings   = [];
+let scoreData     = {};
+let sevChart      = null;
+let catChart      = null;
+
+const SEVERITY_COLOURS = {
+  Critical:      '#d32f2f',
+  High:          '#f57c00',
+  Medium:        '#fbc02d',
+  Low:           '#388e3c',
+  Informational: '#1976d2'
+};
+
+const CATEGORY_MAP = {
+  'identity':    'Identity & Privilege',
+  'config':      'Configuration & GPO',
+  'exploits':    'Exploit & Vulnerability',
+  'persistence': 'Persistence & Backdoor'
+};
+
+const PAGE_TITLES = {
+  overview: 'Overview',
+  identity: 'Identity & Privilege',
+  config: 'Configuration & GPO',
+  exploits: 'Exploits & Vulnerabilities',
+  persistence: 'Persistence & Backdoor',
+  drift: 'Drift Analysis'
+};
+
+// ---------------------------------------------------------------------------
+// Navigation
+// ---------------------------------------------------------------------------
+document.querySelectorAll('#sidebar nav a').forEach(link => {
+  link.addEventListener('click', e => {
+    e.preventDefault();
+    const page = link.dataset.page;
+    document.querySelectorAll('#sidebar nav a').forEach(a => a.classList.remove('active'));
+    link.classList.add('active');
+    document.querySelectorAll('.page-section').forEach(s => s.classList.remove('active'));
+    document.getElementById('page-' + page).classList.add('active');
+    document.getElementById('pageTitle').textContent = PAGE_TITLES[page] || page;
+    if (page === 'drift') loadDrift();
+    if (['identity','config','exploits','persistence'].includes(page)) renderCategoryPage(page);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function showLoading(v) {
+  document.getElementById('loading').style.display = v ? 'flex' : 'none';
+}
+
+async function refreshData() {
+  showLoading(true);
+  try {
+    const [findingsResp, scoreResp] = await Promise.all([
+      fetchJSON('/api/findings'),
+      fetchJSON('/api/score')
+    ]);
+    allFindings = findingsResp.findings || [];
+    scoreData   = scoreResp;
+
+    // Timestamp
+    if (scoreResp.generatedAt) {
+      const d = new Date(scoreResp.generatedAt);
+      document.getElementById('lastUpdated').textContent =
+        'Last scan: ' + d.toLocaleString();
+    }
+
+    renderOverview();
+  } catch(err) {
+    console.error('Data load error:', err);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Overview rendering
+// ---------------------------------------------------------------------------
+function renderOverview() {
+  renderStatCards();
+  renderScoreCircle();
+  renderCharts();
+  renderTopFindings();
+}
+
+function renderStatCards() {
+  const sc = scoreData.severityCounts || {};
+  const items = [
+    { label:'Critical',      count: sc.Critical||0,      bg:'#d32f2f' },
+    { label:'High',          count: sc.High||0,          bg:'#f57c00' },
+    { label:'Medium',        count: sc.Medium||0,        bg:'#fbc02d', fg:'#212121' },
+    { label:'Low',           count: sc.Low||0,           bg:'#388e3c' },
+    { label:'Informational', count: sc.Informational||0, bg:'#1976d2' },
+    { label:'Total',         count: scoreData.totalFindings||0, bg:'#37474f' },
+  ];
+  document.getElementById('statCards').innerHTML = items.map(i => `
+    <div class="col">
+      <div class="stat-card shadow-sm" style="background:${i.bg};color:${i.fg||'#fff'}">
+        <div style="font-size:2em;font-weight:700">${i.count}</div>
+        <div style="font-size:0.8em;opacity:0.9;text-transform:uppercase;letter-spacing:0.05em">${i.label}</div>
+      </div>
+    </div>`).join('');
+}
+
+function renderScoreCircle() {
+  const grade = scoreData.grade || '—';
+  const score = scoreData.score || 0;
+  const gradeColours = {A:'#388e3c',B:'#689f38',C:'#fbc02d',D:'#f57c00',F:'#d32f2f'};
+  const c = gradeColours[grade] || '#757575';
+  const circle = document.getElementById('scoreCircle');
+  circle.style.borderColor = c;
+  document.getElementById('gradeDisplay').textContent = grade;
+  document.getElementById('gradeDisplay').style.color = c;
+  document.getElementById('scoreDisplay').textContent = score + '/100';
+  document.getElementById('gradeDescription').textContent = scoreData.description || '';
+}
+
+function renderCharts() {
+  const sc = scoreData.severityCounts || {};
+  const sevLabels = ['Critical','High','Medium','Low','Informational'];
+  const sevData   = sevLabels.map(l => sc[l] || 0);
+  const sevColours = sevLabels.map(l => SEVERITY_COLOURS[l]);
+
+  const catCounts = scoreData.categoryCounts || {};
+  const catLabels = Object.keys(catCounts);
+  const catData   = catLabels.map(l => catCounts[l]);
+
+  if (sevChart) sevChart.destroy();
+  if (catChart) catChart.destroy();
+
+  sevChart = new Chart(document.getElementById('severityChart'), {
+    type: 'doughnut',
+    data: { labels: sevLabels, datasets:[{ data: sevData, backgroundColor: sevColours, borderWidth: 2 }] },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right', labels:{ boxWidth:12 } } } }
+  });
+
+  catChart = new Chart(document.getElementById('categoryChart'), {
+    type: 'bar',
+    data: { labels: catLabels, datasets:[{ label:'Findings', data: catData, backgroundColor:'#3949ab', borderRadius:4 }] },
+    options: { responsive:true, maintainAspectRatio:false, indexAxis:'y',
+      plugins:{ legend:{ display:false } }, scales:{ x:{ beginAtZero:true } } }
+  });
+}
+
+function renderTopFindings() {
+  const top = allFindings.filter(f => f.Severity === 'Critical' || f.Severity === 'High').slice(0,20);
+  const tbody = document.getElementById('topFindingsBody');
+  if (top.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">No critical or high findings 🎉</td></tr>';
+    return;
+  }
+  tbody.innerHTML = top.map(f => `
+    <tr class="finding-row" onclick="toggleDetail('${f.RuleId}')">
+      <td><code class="text-muted">${esc(f.RuleId||'')}</code></td>
+      <td><span class="badge badge-${(f.Severity||'').toLowerCase()}">${esc(f.Severity||'')}</span></td>
+      <td><small>${esc(f.Category||'')}</small></td>
+      <td>${esc(f.Title||'')}</td>
+      <td><span class="badge bg-secondary">${f.AffectedCount||0}</span></td>
+    </tr>
+    <tr id="detail-${f.RuleId}" class="finding-detail">
+      <td colspan="5">
+        <div class="p-3">
+          <p class="mb-1"><strong>Description:</strong> ${esc(f.Description||'')}</p>
+          <p class="mb-1"><strong>Remediation:</strong> ${esc(f.Remediation||'')}</p>
+          <p class="mb-0"><strong>MITRE ATT&CK:</strong> ${esc(f.MitreAttack||'N/A')}</p>
+          ${f.AffectedObjects && f.AffectedObjects.length > 0 ?
+            '<p class="mb-0 mt-1"><strong>Sample affected:</strong> ' +
+            f.AffectedObjects.slice(0,5).map(a=>'<code>'+esc(String(a))+'</code>').join(', ') + '</p>' : ''}
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
+function toggleDetail(ruleId) {
+  const row = document.getElementById('detail-' + ruleId);
+  if (row) row.classList.toggle('show');
+}
+
+// ---------------------------------------------------------------------------
+// Category pages
+// ---------------------------------------------------------------------------
+function renderCategoryPage(page) {
+  const categoryName = CATEGORY_MAP[page];
+  const container = document.getElementById('findings' + page.charAt(0).toUpperCase() + page.slice(1));
+  const findings = allFindings.filter(f => f.Category === categoryName);
+
+  if (findings.length === 0) {
+    container.innerHTML = '<div class="alert alert-success mt-3"><i class="bi bi-check-circle-fill me-2"></i>No findings in this category. Great work!</div>';
+    return;
+  }
+
+  const html = `
+    <div class="mb-3 d-flex gap-2 flex-wrap align-items-center">
+      <span class="fw-bold">${findings.length} finding(s)</span>
+      ${['Critical','High','Medium','Low','Informational'].map(s => {
+        const n = findings.filter(f=>f.Severity===s).length;
+        return n > 0 ? `<span class="badge badge-${s.toLowerCase()}">${s}: ${n}</span>` : '';
+      }).join('')}
+    </div>
+    <div class="table-responsive">
+      <table class="table table-hover shadow-sm">
+        <thead class="table-dark">
+          <tr><th>ID</th><th>Severity</th><th>Title</th><th>Affected</th><th>MITRE</th></tr>
+        </thead>
+        <tbody>
+          ${findings.map(f => `
+          <tr class="finding-row" onclick="toggleDetail('cat-${f.RuleId}')">
+            <td><code class="text-muted small">${esc(f.RuleId||'')}</code></td>
+            <td><span class="badge badge-${(f.Severity||'').toLowerCase()}">${esc(f.Severity||'')}</span></td>
+            <td>${esc(f.Title||'')}</td>
+            <td><span class="badge bg-secondary">${f.AffectedCount||0}</span></td>
+            <td><small class="text-muted">${esc(f.MitreAttack||'')}</small></td>
+          </tr>
+          <tr id="detail-cat-${f.RuleId}" class="finding-detail">
+            <td colspan="5">
+              <div class="p-3">
+                <p class="mb-1"><strong>Description:</strong> ${esc(f.Description||'')}</p>
+                <p class="mb-1"><strong>Remediation:</strong> ${esc(f.Remediation||'')}</p>
+                ${f.AffectedObjects && f.AffectedObjects.length > 0 ?
+                  '<p class="mb-0"><strong>Affected:</strong> ' +
+                  f.AffectedObjects.slice(0,8).map(a=>'<code>'+esc(String(a))+'</code>').join(', ') + '</p>' : ''}
+              </div>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  container.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Drift analysis
+// ---------------------------------------------------------------------------
+async function loadDrift() {
+  const container = document.getElementById('driftContent');
+  try {
+    const d = await fetchJSON('/api/drift');
+    const { drift, baseline, current } = d;
+    container.innerHTML = `
+      <div class="row g-3 mb-4">
+        <div class="col-md-6">
+          <div class="card shadow-sm">
+            <div class="card-header bg-secondary text-white">Baseline Snapshot</div>
+            <div class="card-body">
+              <p class="mb-1"><strong>Date:</strong> ${baseline.generatedAt||'N/A'}</p>
+              <p class="mb-1"><strong>Grade:</strong> <strong>${baseline.grade}</strong> (${baseline.score}/100)</p>
+              <p class="mb-0"><strong>Findings:</strong> ${baseline.totalFindings}</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card shadow-sm">
+            <div class="card-header bg-primary text-white">Current Snapshot</div>
+            <div class="card-body">
+              <p class="mb-1"><strong>Date:</strong> ${current.generatedAt||'N/A'}</p>
+              <p class="mb-1"><strong>Grade:</strong> <strong>${current.grade}</strong> (${current.score}/100)</p>
+              <p class="mb-0"><strong>Findings:</strong> ${current.totalFindings}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row g-3 mb-4">
+        <div class="col-4"><div class="card drift-new shadow-sm text-center py-3">
+          <div style="font-size:2em;font-weight:700;color:#d32f2f">${drift.newCount}</div>
+          <div class="text-muted">New Findings</div></div></div>
+        <div class="col-4"><div class="card drift-resolved shadow-sm text-center py-3">
+          <div style="font-size:2em;font-weight:700;color:#388e3c">${drift.resolvedCount}</div>
+          <div class="text-muted">Resolved</div></div></div>
+        <div class="col-4"><div class="card drift-persist shadow-sm text-center py-3">
+          <div style="font-size:2em;font-weight:700;color:#f57c00">${drift.persistedCount}</div>
+          <div class="text-muted">Persisted</div></div></div>
+      </div>
+      ${drift.newCount > 0 ? `
+      <div class="card shadow-sm mb-3">
+        <div class="card-header bg-danger text-white"><i class="bi bi-arrow-up-circle-fill me-1"></i>New Findings</div>
+        <ul class="list-group list-group-flush">
+          ${drift.newFindings.slice(0,10).map(f=>`
+          <li class="list-group-item">
+            <span class="badge badge-${(f.Severity||'').toLowerCase()} me-2">${esc(f.Severity||'')}</span>
+            <code class="text-muted me-2 small">${esc(f.RuleId||'')}</code>${esc(f.Title||'')}
+          </li>`).join('')}
+        </ul>
+      </div>` : ''}
+      ${drift.resolvedCount > 0 ? `
+      <div class="card shadow-sm mb-3">
+        <div class="card-header bg-success text-white"><i class="bi bi-check-circle-fill me-1"></i>Resolved Findings</div>
+        <ul class="list-group list-group-flush">
+          ${drift.resolvedFindings.slice(0,10).map(f=>`
+          <li class="list-group-item">
+            <span class="badge badge-${(f.Severity||'').toLowerCase()} me-2">${esc(f.Severity||'')}</span>
+            <code class="text-muted me-2 small">${esc(f.RuleId||'')}</code>${esc(f.Title||'')}
+          </li>`).join('')}
+        </ul>
+      </div>` : ''}`;
+  } catch(err) {
+    container.innerHTML = `<div class="alert alert-info"><i class="bi bi-info-circle me-2"></i>
+      Drift analysis requires at least 2 assessment snapshots. Run AD-Wall twice to enable comparison.</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+function esc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+refreshData();
+</script>
+</body>
+</html>
