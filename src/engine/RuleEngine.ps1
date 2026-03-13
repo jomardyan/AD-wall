@@ -101,6 +101,21 @@ $Script:RuleCatalog = @(
     [PSCustomObject]@{ RuleId='COMP-061'; Category='Compliance'; Name='No gMSA Accounts Found';                         Severity='Informational'; MitreAttack='T1558.003'; Enabled=$true }
     [PSCustomObject]@{ RuleId='COMP-070'; Category='Compliance'; Name='DA Accounts With Email (Mixed-Use)';             Severity='High';     MitreAttack='T1566';     Enabled=$true }
     [PSCustomObject]@{ RuleId='COMP-071'; Category='Compliance'; Name='DA Accounts Without Admin Naming Convention';    Severity='Medium';   MitreAttack='T1078.002'; Enabled=$true }
+    # Attack Techniques (Joint Govt Guidance — 20 AD Attack Types)
+    [PSCustomObject]@{ RuleId='ATK-001'; Category='Attack Techniques'; Name='Password Spraying Surface';                       Severity='Critical'; MitreAttack='T1110.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-002'; Category='Attack Techniques'; Name='MachineAccountQuota > 0';                         Severity='High';     MitreAttack='T1136.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-003'; Category='Attack Techniques'; Name='KRBTGT Password Not Rotated (> 180 days)';        Severity='Critical'; MitreAttack='T1558.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-004'; Category='Attack Techniques'; Name='KRBTGT Password Stale (90-180 days)';             Severity='High';     MitreAttack='T1558.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-005'; Category='Attack Techniques'; Name='Silver Ticket Surface (RC4-only service accts)';  Severity='High';     MitreAttack='T1558.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-006'; Category='Attack Techniques'; Name='Golden Certificate Risk (long-lived CA / no HSM)'; Severity='High';    MitreAttack='T1649';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-007'; Category='Attack Techniques'; Name='NTDS.dit Access Rights Overpermissioned';         Severity='Critical'; MitreAttack='T1003.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-008'; Category='Attack Techniques'; Name='AD FS Token Signing Cert Exposure';               Severity='Critical'; MitreAttack='T1606.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-009'; Category='Attack Techniques'; Name='Entra Connect Sync Account Exposure';             Severity='Critical'; MitreAttack='T1098.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-010'; Category='Attack Techniques'; Name='Pass-the-Hash Surface (NTLMv1/No LAPS)';          Severity='High';     MitreAttack='T1550.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-011'; Category='Attack Techniques'; Name='Pass-the-Ticket Surface (Forwardable/Unconstrained)'; Severity='Medium'; MitreAttack='T1550.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-012'; Category='Attack Techniques'; Name='DCShadow Risk (Replication Rights Misconfiguration)'; Severity='Critical'; MitreAttack='T1207'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-013'; Category='Attack Techniques'; Name='NTLM Relay Surface (Multiple Vectors)';           Severity='Critical'; MitreAttack='T1557.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-014'; Category='Attack Techniques'; Name='MachineAccountQuota Abuse Path';                  Severity='Medium';   MitreAttack='T1136.001'; Enabled=$true }
 )
 
 #endregion
@@ -319,6 +334,18 @@ function Invoke-AllChecks {
         catch { Write-Warning "Compliance module error: $_" }
     }
 
+    # Attack Techniques (20 attack types — blue team detection)
+    if ('OffensiveTechniques' -in $Modules -or 'Exploit' -in $Modules) {
+        Write-Verbose "=== Running Attack Techniques checks ==="
+        try {
+            if (Get-Command Invoke-AllOffensiveTechniqueChecks -ErrorAction SilentlyContinue) {
+                $atkFindings = Invoke-AllOffensiveTechniqueChecks -CollectedData $CollectedData -DomainName $DomainName
+                $atkFindings | ForEach-Object { $allFindings.Add($_) }
+            }
+        }
+        catch { Write-Warning "Attack Techniques module error: $_" }
+    }
+
     # Enrich with rule metadata and deduplicate
     $enriched = Invoke-FindingEnrichment -Findings $allFindings.ToArray()
     $deduped  = Invoke-FindingDeduplication -Findings $enriched
@@ -389,6 +416,21 @@ function Invoke-FindingEnrichment {
         'COMP-061' = 'Get-ADServiceAccount -Filter * | Select-Object SamAccountName, objectClass'
         'COMP-070' = 'Get-ADGroupMember -Identity "Domain Admins" | Get-ADUser -Properties EmailAddress | Where-Object {$_.EmailAddress} | Select-Object SamAccountName, EmailAddress'
         'COMP-071' = 'Get-ADGroupMember -Identity "Domain Admins" | Get-ADUser -Properties EmailAddress | Select-Object SamAccountName, EmailAddress'
+        # Attack Techniques
+        'ATK-001' = 'Get-ADDefaultDomainPasswordPolicy | Select-Object LockoutThreshold, LockoutDuration, LockoutObservationWindow'
+        'ATK-002' = 'Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties "ms-DS-MachineAccountQuota" | Select-Object "ms-DS-MachineAccountQuota"'
+        'ATK-003' = 'Get-ADUser -Identity krbtgt -Properties PasswordLastSet | Select-Object SamAccountName, PasswordLastSet'
+        'ATK-004' = 'Get-ADUser -Identity krbtgt -Properties PasswordLastSet | Select-Object SamAccountName, PasswordLastSet'
+        'ATK-005' = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null" -and Enabled -eq $true} -Properties ServicePrincipalNames,"msDS-SupportedEncryptionTypes" | Where-Object { -not ($_."msDS-SupportedEncryptionTypes" -band 24) } | Select-Object SamAccountName,"msDS-SupportedEncryptionTypes"'
+        'ATK-006' = 'certutil -dump | Select-String "NotAfter|Provider"'
+        'ATK-007' = '(Get-ACL "AD:DC=$((Get-ADDomain).DistinguishedName)").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" -and $_.IdentityReference -notmatch "Domain Controllers" } | Select-Object IdentityReference'
+        'ATK-008' = 'Get-ADUser -Filter {SamAccountName -like "adfssvc*" -or SamAccountName -like "adfs*"} | Select-Object SamAccountName, Enabled'
+        'ATK-009' = 'Get-ADUser -Filter {SamAccountName -like "MSOL_*" -or SamAccountName -like "AAD_*"} -Properties PasswordLastSet | Select-Object SamAccountName, PasswordLastSet, Enabled'
+        'ATK-010' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel","NoLMHash" -ErrorAction SilentlyContinue'
+        'ATK-011' = 'Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties maxTicketAge,maxRenewAge | Select-Object maxTicketAge,maxRenewAge'
+        'ATK-012' = 'Get-ADObject -SearchBase "CN=Sites,CN=Configuration,$((Get-ADDomain).DistinguishedName)" -Filter {objectClass -eq "nTDSDSA"} | Select-Object DistinguishedName, Created | Sort-Object Created -Descending'
+        'ATK-013' = 'Get-SmbServerConfiguration | Select-Object RequireSecuritySignature; Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LDAPServerIntegrity" -ErrorAction SilentlyContinue'
+        'ATK-014' = 'Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties "ms-DS-MachineAccountQuota" | Select-Object "ms-DS-MachineAccountQuota"'
     }
 
     foreach ($finding in $Findings) {

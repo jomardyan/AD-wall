@@ -926,6 +926,54 @@ def api_report_download(filename: str):
     return send_file(file_path, as_attachment=False)
 
 
+@app.route("/api/redteam")
+def api_redteam():
+    """Return red team simulation results from the latest or specified run."""
+    run_id = request.args.get("run_id")
+    if run_id:
+        run = db.get_run(run_id)
+        if not run:
+            return jsonify({"results": [], "total": 0, "error": "Run not found"})
+        findings = db.get_findings_api(run_id, category="Red Team")
+    else:
+        runs = db.list_runs(limit=1)
+        if not runs:
+            return jsonify({"results": [], "total": 0})
+        findings = db.get_findings_api(runs[0]["id"], category="Red Team")
+    return jsonify({"results": findings, "total": len(findings)})
+
+
+# Static catalog of all 20 AD attack techniques
+_ATTACK_TECHNIQUES_CATALOG = [
+    {"id": "T1558.003", "name": "Kerberoasting",                      "ruleId": "EV-001",  "description": "Offline cracking of service account password hashes via TGS requests.", "detectionEvents": ["4769"], "mitigations": ["Enforce AES encryption", "Use gMSA"], "severity": "Critical"},
+    {"id": "T1558.004", "name": "AS-REP Roasting",                    "ruleId": "IP-017",  "description": "Request AS-REP without pre-auth for accounts with pre-auth disabled.", "detectionEvents": ["4768", "4771"], "mitigations": ["Enable Kerberos pre-authentication"], "severity": "High"},
+    {"id": "T1110.003", "name": "Password Spraying",                   "ruleId": "ATK-001", "description": "Spray common passwords against many accounts to avoid lockout.", "detectionEvents": ["4625", "4740"], "mitigations": ["Set lockout threshold 5-10", "Deploy Smart Lockout"], "severity": "Critical"},
+    {"id": "T1136.001", "name": "MachineAccountQuota Compromise",      "ruleId": "ATK-002", "description": "Any domain user adds machine accounts enabling RBCD attacks.", "detectionEvents": ["4741"], "mitigations": ["Set MachineAccountQuota to 0"], "severity": "High"},
+    {"id": "T1558",     "name": "Unconstrained Delegation",            "ruleId": "IP-030",  "description": "Hosts with unconstrained delegation receive forwardable TGTs.", "detectionEvents": ["4769"], "mitigations": ["Use constrained/RBCD delegation", "Add to Protected Users"], "severity": "Critical"},
+    {"id": "T1552.006", "name": "GPP/cPassword",                       "ruleId": "CG-010",  "description": "Cleartext passwords stored in Group Policy Preferences XML in SYSVOL.", "detectionEvents": ["5145"], "mitigations": ["Apply MS14-025", "Delete cpassword GPPs"], "severity": "Critical"},
+    {"id": "T1649",     "name": "AD CS Compromise (ESC1-ESC8)",        "ruleId": "EV-040",  "description": "Certificate template misconfigurations enabling privilege escalation.", "detectionEvents": ["4886", "4887"], "mitigations": ["Audit certificate templates", "Require CA manager approval"], "severity": "Critical"},
+    {"id": "T1649",     "name": "Golden Certificate",                  "ruleId": "ATK-006", "description": "CA private key theft enables forging of trusted certificates indefinitely.", "detectionEvents": ["4886"], "mitigations": ["Protect CA key with HSM", "Restrict CA server access"], "severity": "Critical"},
+    {"id": "T1003.006", "name": "DCSync",                              "ruleId": "PB-020",  "description": "Accounts with replication rights extract all domain password hashes.", "detectionEvents": ["4662"], "mitigations": ["Restrict DS-Replication rights", "Deploy MDI"], "severity": "Critical"},
+    {"id": "T1003.003", "name": "Dumping NTDS.dit",                   "ruleId": "ATK-007", "description": "Extract AD database containing all credentials via VSS or IFM.", "detectionEvents": ["7036", "4688"], "mitigations": ["Restrict DC admin access", "Monitor VSS operations"], "severity": "Critical"},
+    {"id": "T1558.001", "name": "Golden Ticket",                       "ruleId": "ATK-003", "description": "Forge Kerberos TGTs using KRBTGT hash for persistent DA access.", "detectionEvents": ["4769", "4672"], "mitigations": ["Rotate KRBTGT twice every 180 days", "Deploy MDI"], "severity": "Critical"},
+    {"id": "T1558.002", "name": "Silver Ticket",                       "ruleId": "ATK-005", "description": "Forge service tickets using service account hash without KDC involvement.", "detectionEvents": ["Service-side logs only"], "mitigations": ["Enforce AES encryption on service accounts", "Use gMSA"], "severity": "High"},
+    {"id": "T1606.002", "name": "Golden SAML",                         "ruleId": "ATK-008", "description": "Forge SAML assertions using stolen AD FS token-signing certificate.", "detectionEvents": ["AD FS 403/501", "Azure AD anomalies"], "mitigations": ["HSM for AD FS cert", "Migrate to AAD SSO"], "severity": "Critical"},
+    {"id": "T1098.001", "name": "Microsoft Entra Connect Compromise",  "ruleId": "ATK-009", "description": "Compromise MSOL_ sync accounts for on-prem + cloud credential access.", "detectionEvents": ["4662", "Azure AD sign-in logs"], "mitigations": ["Protect AAD Connect server (Tier 0)", "Monitor MSOL_ accounts"], "severity": "Critical"},
+    {"id": "T1134.005", "name": "One-Way Domain Trust Bypass",         "ruleId": "CG-020",  "description": "SID filtering disabled on trusts allows cross-domain SID history abuse.", "detectionEvents": ["4675"], "mitigations": ["Enable SID filtering on all trusts"], "severity": "High"},
+    {"id": "T1134.005", "name": "SID History Compromise",             "ruleId": "PB-010",  "description": "Adding privileged SIDs to SID history grants hidden elevated rights.", "detectionEvents": ["4765", "4766"], "mitigations": ["Audit SID history", "Clear after migrations"], "severity": "Critical"},
+    {"id": "T1556.001", "name": "Skeleton Key",                        "ruleId": "PB-030",  "description": "LSASS patch on DC allows master password login as any domain account.", "detectionEvents": ["7045", "4688 (mimikatz)"], "mitigations": ["Enable Credential Guard", "LSASS PPL"], "severity": "Critical"},
+    {"id": "T1550.002", "name": "Pass the Hash (PTH)",                "ruleId": "ATK-010", "description": "Use NTLM hash directly without cracking to authenticate laterally.", "detectionEvents": ["4624 type 3", "4776"], "mitigations": ["Deploy LAPS", "Disable NTLMv1", "Restricted Admin Mode"], "severity": "High"},
+    {"id": "T1550.003", "name": "Pass the Ticket (PTT)",              "ruleId": "ATK-011", "description": "Steal and inject Kerberos tickets to authenticate as another user.", "detectionEvents": ["4769", "4624"], "mitigations": ["Remove unconstrained delegation", "Protected Users group"], "severity": "High"},
+    {"id": "T1207",     "name": "DCShadow",                            "ruleId": "ATK-012", "description": "Register rogue DC to inject malicious AD changes bypassing audit.", "detectionEvents": ["5136", "nTDSDSA creation"], "mitigations": ["Deploy MDI", "Monitor Configuration NC changes"], "severity": "Critical"},
+]
+
+
+@app.route("/api/attack-techniques")
+def api_attack_techniques():
+    """Return the static catalog of all 20 AD attack techniques."""
+    return jsonify({"techniques": _ATTACK_TECHNIQUES_CATALOG, "total": len(_ATTACK_TECHNIQUES_CATALOG)})
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

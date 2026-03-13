@@ -100,7 +100,7 @@ param(
     [string]$Mode            = 'Assessment',
     [switch]$RedTeam,
     [bool]$SafeMode          = $true,
-    [ValidateSet('Identity','Config','Exploit','Persistence','Detection','Compliance')]
+    [ValidateSet('Identity','Config','Exploit','Persistence','Detection','Compliance','OffensiveTechniques','RedTeam')]
     [string[]]$Modules       = @('Identity','Config','Exploit','Persistence','Detection','Compliance'),
     [ValidateSet('HTML','JSON','CSV','Markdown','CEF','Splunk','All')]
     [string[]]$Format        = @('HTML','JSON'),
@@ -211,6 +211,7 @@ Import-ADWallModule 'src\modules\ExploitVuln.ps1'
 Import-ADWallModule 'src\modules\PersistenceBackdoor.ps1'
 Import-ADWallModule 'src\modules\DetectionEngineering.ps1'
 Import-ADWallModule 'src\modules\ComplianceCheck.ps1'
+Import-ADWallModule 'src\modules\OffensiveTechniques.ps1'
 Import-ADWallModule 'src\engine\RuleEngine.ps1'
 Import-ADWallModule 'src\engine\RiskEngine.ps1'
 Import-ADWallModule 'src\engine\AttackGraphEngine.ps1'
@@ -530,6 +531,47 @@ catch { Write-Step "Evidence store error: $_" 'WARN' }
 
 #endregion
 
+#region Red Team Simulation
+
+$redTeamResults = @()
+if ($RedTeam) {
+    Write-Step "=== Phase 5b: Red Team Simulation ===" 'SECTION'
+    try {
+        Import-ADWallModule 'src\modules\RedTeam.ps1'
+        if (Get-Command Invoke-AllRedTeamChecks -ErrorAction SilentlyContinue) {
+            $redTeamResults = Invoke-AllRedTeamChecks -ADData $collectedData -SafeMode $SafeMode
+            Write-Step "Red Team simulation complete. $($redTeamResults.Count) attack checks run." 'OK'
+            # Map MITRE IDs to ATK-* RuleIds where possible
+            $mitreToRuleId = @{
+                'T1110.003' = 'ATK-001'; 'T1136.001' = 'ATK-002'; 'T1558.001' = 'ATK-003'
+                'T1558.002' = 'ATK-005'; 'T1649'     = 'ATK-006'; 'T1003.003' = 'ATK-007'
+                'T1606.002' = 'ATK-008'; 'T1098.001' = 'ATK-009'; 'T1550.002' = 'ATK-010'
+                'T1550.003' = 'ATK-011'; 'T1207'     = 'ATK-012'; 'T1557.001' = 'ATK-013'
+            }
+            # Add red team results as findings to the pipeline
+            foreach ($rt in $redTeamResults) {
+                $ruleId = if ($mitreToRuleId.ContainsKey($rt.MITRE)) { $mitreToRuleId[$rt.MITRE] } else { "ATK-RT-$($rt.MITRE -replace '[^A-Z0-9]','-')" }
+                $rtFinding = [PSCustomObject]@{
+                    RuleId          = $ruleId
+                    Title           = "[Red Team] $($rt.AttackType)"
+                    Severity        = $rt.RiskLevel
+                    Category        = 'Red Team'
+                    Description     = $rt.AttackPath
+                    AffectedObjects = $rt.Findings | ForEach-Object { if ($_.Account) { $_.Account } elseif ($_.Note) { $_.Note } else { '' } } | Where-Object { $_ }
+                    AffectedCount   = $rt.ExploitableCount
+                    Remediation     = $rt.Mitigations -join '; '
+                    MitreAttack     = $rt.MITRE
+                    DetectedAt      = $rt.RunAt
+                }
+                $allFindings = @($allFindings) + @($rtFinding)
+            }
+        }
+    }
+    catch { Write-Step "Red Team simulation error: $_" 'WARN' }
+}
+
+#endregion
+
 #region Report Generation
 
 Write-Step "=== Phase 6: Generating Reports ===" 'SECTION'
@@ -544,6 +586,8 @@ $reportMeta = @{
     Modules          = $Modules
     ScanDate         = $Script:StartTime.ToString('o')
     OrgName          = $OrgName
+    RedTeam          = [bool]$RedTeam
+    RedTeamCount     = $redTeamResults.Count
 }
 
 foreach ($fmt in $reportFormats) {

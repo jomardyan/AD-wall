@@ -99,6 +99,7 @@
     <a href="#" data-page="compliance"><i class="bi bi-patch-check"></i><span>Compliance</span></a>
     <a href="#" data-page="attackpaths"><i class="bi bi-diagram-3"></i><span>Attack Paths</span></a>
     <a href="#" data-page="drift"><i class="bi bi-graph-up-arrow"></i><span>Drift Analysis</span></a>
+    <a href="#" data-page="redteam" style="color:#ff6b6b;"><i class="bi bi-crosshair"></i><span>🔴 Red Team</span></a>
     <hr style="border-color:rgba(255,255,255,0.12);margin:6px 0;">
     <a href="#" data-page="run"><i class="bi bi-play-circle"></i><span>Run Assessment</span></a>
     <a href="#" data-page="history"><i class="bi bi-clock-history"></i><span>Run History</span></a>
@@ -212,6 +213,77 @@
       <div id="driftContent">
         <div class="text-center py-5 text-muted">
           <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>Loading drift analysis…
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════ RED TEAM ══════════════════════════════ -->
+    <div id="page-redteam" class="page-section">
+      <!-- Active-run Red Team banner -->
+      <div id="redteam-active-banner" class="alert alert-danger d-none mb-3" role="alert">
+        <i class="bi bi-exclamation-triangle-fill me-2"></i>
+        <strong>Red Team mode was active in this run.</strong>
+        Simulation results and offensive analysis are available below.
+        All operations were READ-ONLY enumeration.
+      </div>
+
+      <!-- Safe mode warning -->
+      <div class="alert alert-warning mb-3" role="alert">
+        <i class="bi bi-shield-exclamation me-2"></i>
+        <strong>Red Team Simulation requires <code>-SafeMode:$false</code></strong> to perform active checks.
+        In safe mode (default), functions return metadata only — what they would target, commands they would run, and expected impact.
+        <br><small class="text-muted mt-1 d-block">To enable: <code>Invoke-ADWall.ps1 -RedTeam -SafeMode:$false</code> — use only in authorised assessments.</small>
+      </div>
+
+      <div class="row g-3">
+        <!-- LEFT: Blue Team Detection Summary -->
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header">
+              <i class="bi bi-shield-check me-2 text-primary"></i><strong>Blue Team — Detection Coverage</strong>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-sm table-hover mb-0" id="attackTechniquesTable">
+                  <thead class="table-dark">
+                    <tr>
+                      <th>Attack</th>
+                      <th>MITRE</th>
+                      <th>Severity</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="attackTechniquesBody">
+                    <tr><td colspan="4" class="text-center text-muted py-3"><i class="bi bi-hourglass-split me-2"></i>Loading…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: Red Team Simulation Controls -->
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex align-items-center">
+              <span class="badge bg-danger me-2">RED</span><strong>Red Team — Simulation Checks</strong>
+            </div>
+            <div class="card-body">
+              <div id="redteam-simulation-list">
+                <div class="text-center text-muted py-3"><i class="bi bi-hourglass-split me-2"></i>Loading…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detailed findings for a selected technique -->
+      <div id="redteam-detail-panel" class="mt-3 d-none">
+        <div class="card border-danger">
+          <div class="card-header bg-danger text-white">
+            <i class="bi bi-crosshair me-2"></i><span id="redteam-detail-title">Attack Detail</span>
+          </div>
+          <div class="card-body" id="redteam-detail-body"></div>
         </div>
       </div>
     </div>
@@ -621,6 +693,7 @@ function onPageActivate(page) {
   if (page === 'compliance') { loadCompliance(); }
   if (page === 'attackpaths'){ loadAttackPaths(); }
   if (page === 'drift')      { loadDrift(); }
+  if (page === 'redteam')    { loadRedTeamPage(); }
   if (page === 'run')        { updateCommand(); }
   if (page === 'history')    { loadHistory(); }
   if (page === 'reports')    { loadReports(); }
@@ -877,6 +950,145 @@ async function loadDrift() {
   } catch(e) {
     el.innerHTML = `<div class="alert alert-info m-3">${esc(e.message||'Need at least 2 assessments for drift comparison.')}</div>`;
   }
+}
+
+// ─────────────────────────── Red Team Page ───────────────────────────────────
+async function loadRedTeamPage() {
+  try {
+    // Load technique catalog
+    const catalogData = await fetchJSON('/api/attack-techniques');
+    const techniques = catalogData.techniques || [];
+
+    // Load red team simulation results (if any)
+    let rtResults = [];
+    try {
+      const rtData = await fetchJSON('/api/redteam');
+      rtResults = rtData.results || [];
+    } catch(e) { /* no red team results yet */ }
+
+    // Show active banner if red team findings exist
+    const banner = document.getElementById('redteam-active-banner');
+    if (rtResults.length > 0 && banner) {
+      banner.classList.remove('d-none');
+    }
+
+    // Severity badge helper
+    const sevBadge = sev => {
+      const cls = sev === 'Critical' ? 'danger' : sev === 'High' ? 'warning' :
+                  sev === 'Medium' ? 'info' : 'secondary';
+      return `<span class="badge bg-${cls}">${esc(sev)}</span>`;
+    };
+
+    // Status from current run findings
+    const allFindings = [];
+    try {
+      const fData = await fetchJSON('/api/findings');
+      (fData.findings || []).forEach(f => allFindings.push(f));
+    } catch(e) {}
+
+    const detectedRuleIds = new Set(allFindings.map(f => f.rule_id));
+
+    // Build technique table
+    const tbody = document.getElementById('attackTechniquesBody');
+    if (tbody) {
+      tbody.innerHTML = techniques.map(t => {
+        const found = detectedRuleIds.has(t.ruleId);
+        const status = found
+          ? `<span class="badge bg-danger"><i class="bi bi-exclamation-circle me-1"></i>Detected</span>`
+          : `<span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Clean</span>`;
+        return `<tr style="cursor:pointer" onclick='showAttackTechniqueDetail(this.dataset.json)' data-json='${esc(JSON.stringify(t))}'>
+          <td class="small fw-semibold">${esc(t.name)}</td>
+          <td><code class="small">${esc(t.id)}</code></td>
+          <td>${sevBadge(t.severity)}</td>
+          <td>${status}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Build simulation list
+    const simList = document.getElementById('redteam-simulation-list');
+    if (simList) {
+      const simTechs = [
+        { name: 'Kerberoasting', fn: 'Invoke-RedTeamKerberoast', mitre: 'T1558.003', risk: 'Critical' },
+        { name: 'AS-REP Roasting', fn: 'Invoke-RedTeamASREPRoast', mitre: 'T1558.004', risk: 'High' },
+        { name: 'Password Spraying', fn: 'Invoke-RedTeamPasswordSpray', mitre: 'T1110.003', risk: 'High' },
+        { name: 'MachineAccountQuota', fn: 'Invoke-RedTeamMachineAccountQuota', mitre: 'T1136.001', risk: 'High' },
+        { name: 'Unconstrained Delegation', fn: 'Invoke-RedTeamUnconstrainedDelegation', mitre: 'T1558', risk: 'Critical' },
+        { name: 'GPP/cPassword', fn: 'Invoke-RedTeamGPPCPassword', mitre: 'T1552.006', risk: 'Critical' },
+        { name: 'AD CS (ESC1-8)', fn: 'Invoke-RedTeamADCS', mitre: 'T1649', risk: 'Critical' },
+        { name: 'Golden Certificate', fn: 'Invoke-RedTeamGoldenCertificate', mitre: 'T1649', risk: 'Critical' },
+        { name: 'DCSync', fn: 'Invoke-RedTeamDCSync', mitre: 'T1003.006', risk: 'Critical' },
+        { name: 'NTDS.dit Dump', fn: 'Invoke-RedTeamNtdsDit', mitre: 'T1003.003', risk: 'Critical' },
+        { name: 'Golden Ticket', fn: 'Invoke-RedTeamGoldenTicket', mitre: 'T1558.001', risk: 'Critical' },
+        { name: 'Silver Ticket', fn: 'Invoke-RedTeamSilverTicket', mitre: 'T1558.002', risk: 'High' },
+        { name: 'Golden SAML', fn: 'Invoke-RedTeamGoldenSAML', mitre: 'T1606.002', risk: 'Critical' },
+        { name: 'Entra Connect', fn: 'Invoke-RedTeamEntraConnect', mitre: 'T1098.001', risk: 'Critical' },
+        { name: 'Trust Bypass', fn: 'Invoke-RedTeamTrustBypass', mitre: 'T1134.005', risk: 'High' },
+        { name: 'SID History', fn: 'Invoke-RedTeamSIDHistory', mitre: 'T1134.005', risk: 'Critical' },
+        { name: 'Skeleton Key', fn: 'Invoke-RedTeamSkeletonKey', mitre: 'T1556.001', risk: 'Critical' },
+        { name: 'Pass the Hash', fn: 'Invoke-RedTeamPassTheHash', mitre: 'T1550.002', risk: 'High' },
+        { name: 'Pass the Ticket', fn: 'Invoke-RedTeamPassTheTicket', mitre: 'T1550.003', risk: 'High' },
+        { name: 'DCShadow', fn: 'Invoke-RedTeamDCShadow', mitre: 'T1207', risk: 'Critical' },
+      ];
+      const riskBadge = r => {
+        const cls = r === 'Critical' ? 'danger' : r === 'High' ? 'warning' : 'info';
+        return `<span class="badge bg-${cls} ms-1">${esc(r)}</span>`;
+      };
+      simList.innerHTML = `<div class="list-group list-group-flush">` +
+        simTechs.map(t => {
+          const hasResult = rtResults.some(r => r.title && r.title.includes(t.name));
+          return `<div class="list-group-item d-flex justify-content-between align-items-center px-2 py-2">
+            <span class="small fw-semibold">${esc(t.name)} <code class="text-muted">${esc(t.mitre)}</code>${riskBadge(t.risk)}</span>
+            <button class="btn btn-sm btn-outline-danger" onclick='showSimPreview(this.dataset.json)' data-json='${esc(JSON.stringify(t))}'>
+              <i class="bi bi-play-circle me-1"></i>${hasResult ? 'Results' : 'Preview'}
+            </button>
+          </div>`;
+        }).join('') + `</div>`;
+    }
+  } catch(e) {
+    console.error('Red Team page error:', e);
+  }
+}
+
+function showAttackTechniqueDetail(el) {
+  const jsonStr = (typeof el === 'string') ? el : el.dataset.json;
+  const t = JSON.parse(jsonStr);
+  const panel = document.getElementById('redteam-detail-panel');
+  const title = document.getElementById('redteam-detail-title');
+  const body  = document.getElementById('redteam-detail-body');
+  if (!panel || !title || !body) return;
+  title.textContent = t.name + ' (' + t.id + ')';
+  body.innerHTML = `
+    <p class="mb-2"><strong>Description:</strong> ${esc(t.description)}</p>
+    <p class="mb-2"><strong>Detection Events:</strong> ${(t.detectionEvents||[]).map(e => `<code>${esc(e)}</code>`).join(', ')}</p>
+    <p class="mb-0"><strong>Mitigations:</strong></p>
+    <ul class="mb-0 small">${(t.mitigations||[]).map(m => `<li>${esc(m)}</li>`).join('')}</ul>
+  `;
+  panel.classList.remove('d-none');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function showSimPreview(el) {
+  const jsonStr = (typeof el === 'string') ? el : el.dataset.json;
+  const t = JSON.parse(jsonStr);
+  const panel = document.getElementById('redteam-detail-panel');
+  const title = document.getElementById('redteam-detail-title');
+  const body  = document.getElementById('redteam-detail-body');
+  if (!panel || !title || !body) return;
+  title.innerHTML = `<span class="badge bg-danger me-2">RED TEAM</span> ${esc(t.name)} Simulation Preview`;
+  body.innerHTML = `
+    <div class="alert alert-warning mb-3">
+      <i class="bi bi-info-circle me-2"></i>
+      <strong>Safe Mode Preview</strong> — This shows what the simulation <em>would</em> target.
+      Active mode requires <code>-SafeMode:$false</code>.
+    </div>
+    <p><strong>PowerShell Function:</strong> <code>${esc(t.fn)}</code></p>
+    <p><strong>MITRE ATT&CK:</strong> <a href="https://attack.mitre.org/techniques/${esc(t.mitre.replace('.','/'))}/" target="_blank" rel="noopener">${esc(t.mitre)}</a></p>
+    <p><strong>Risk Level:</strong> <span class="badge bg-danger">${esc(t.risk)}</span></p>
+    <p class="mb-0 small text-muted">Run <code>Invoke-ADWall.ps1 -RedTeam -SafeMode:$false</code> to collect full simulation results.</p>
+  `;
+  panel.classList.remove('d-none');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 // ─────────────────────────── Run Form ────────────────────────────────────────
