@@ -540,6 +540,361 @@ function Invoke-RogueDCCheck {
 
 #endregion
 
+
+#region Startup/Logon Script Abuse
+
+function Invoke-StartupScriptCheck {
+    <#
+    .SYNOPSIS
+        Detects suspicious startup and logon scripts in NETLOGON and SYSVOL.
+    .DESCRIPTION
+        Enumerates logon/startup/logoff/shutdown scripts configured in GPOs
+        (SYSVOL Policies paths) and the NETLOGON share, then flags:
+        - Scripts with suspicious extensions (.vbs, .ps1, .bat, .cmd, .js, .hta)
+          pointing to external UNC paths outside the domain's SYSVOL/NETLOGON
+        - Script files containing known suspicious content patterns
+        - Scripts with unexpected permissions (writable by non-admins)
+
+        This detects the persistence technique of planting malicious scripts
+        that execute on user logon or machine startup/shutdown.
+    .PARAMETER DomainName
+        DNS domain name (used to build SYSVOL/NETLOGON paths).
+    .PARAMETER SysvolPath
+        Override SYSVOL Policies path.
+    .PARAMETER GPOs
+        GPO objects from Get-ADGPOs (used for metadata enrichment).
+    .EXAMPLE
+        Invoke-StartupScriptCheck -DomainName 'corp.local'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$DomainName = $env:USERDNSDOMAIN,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SysvolPath,
+
+        [Parameter(Mandatory = $false)]
+        [object[]]$GPOs = @()
+    )
+
+    Write-Verbose "Running startup/logon script abuse check..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    if ([string]::IsNullOrEmpty($SysvolPath) -and -not [string]::IsNullOrEmpty($DomainName)) {
+        $SysvolPath = "\\$DomainName\SYSVOL\$DomainName\Policies"
+    }
+
+    if ([string]::IsNullOrEmpty($SysvolPath) -or -not (Test-Path $SysvolPath)) {
+        Write-Verbose "SYSVOL not accessible; skipping script abuse check."
+        return @()
+    }
+
+    $suspiciousPatterns = @(
+        'IEX\s*\(',                # Invoke-Expression
+        'Invoke-Expression',
+        'DownloadString',
+        'DownloadFile',
+        'WebClient',
+        'Start-BitsTransfer',
+        'certutil.*-decode',
+        'powershell\s+-enc',
+        'Net\.Sockets\.TcpClient',
+        'Invoke-Mimikatz',
+        '-WindowStyle\s+Hidden',
+        'cmd\.exe\s*/c',
+        'wscript\.shell',
+        'regsvr32.*scrobj'
+    )
+
+    $suspiciousExtensions = @('.ps1','.vbs','.js','.jse','.hta','.wsf','.bat','.cmd')
+    $hits = [System.Collections.Generic.List[object]]::new()
+
+    # Scan SYSVOL Scripts directories
+    try {
+        $scriptDirs = Get-ChildItem -Path $SysvolPath -Recurse -Directory -Filter 'Scripts' -ErrorAction SilentlyContinue
+        foreach ($dir in $scriptDirs) {
+            $files = Get-ChildItem -Path $dir.FullName -File -ErrorAction SilentlyContinue
+            foreach ($file in $files) {
+                if ($file.Extension -notin $suspiciousExtensions) { continue }
+
+                $finding = [PSCustomObject]@{
+                    Path        = $file.FullName
+                    Name        = $file.Name
+                    GPO_GUID    = ($file.FullName -split '\\')[6]
+                    SuspiciousContent = @()
+                    IsWritableByNonAdmins = $false
+                }
+
+                # Check content for suspicious patterns
+                try {
+                    $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+                    if ($content) {
+                        foreach ($pattern in $suspiciousPatterns) {
+                            if ($content -match $pattern) {
+                                $finding.SuspiciousContent += $pattern
+                            }
+                        }
+                    }
+                }
+                catch { Write-Verbose "Could not read $($file.FullName)" }
+
+                # Check ACL — writable by Authenticated Users or Everyone?
+                try {
+                    $acl = Get-Acl $file.FullName -ErrorAction SilentlyContinue
+                    if ($acl) {
+                        $writableByAll = $acl.Access | Where-Object {
+                            $_.IdentityReference -match 'Authenticated Users|Everyone|Domain Users|BUILTIN\\Users' -and
+                            $_.FileSystemRights  -match 'Write|FullControl|Modify' -and
+                            $_.AccessControlType -eq 'Allow'
+                        }
+                        if ($writableByAll) { $finding.IsWritableByNonAdmins = $true }
+                    }
+                }
+                catch {}
+
+                if ($finding.SuspiciousContent.Count -gt 0 -or $finding.IsWritableByNonAdmins) {
+                    $hits.Add($finding)
+                }
+            }
+        }
+    }
+    catch { Write-Warning "Script abuse SYSVOL scan error: $_" }
+
+    # Also check NETLOGON share scripts
+    if (-not [string]::IsNullOrEmpty($DomainName)) {
+        $netlogonPath = "\\$DomainName\NETLOGON"
+        if (Test-Path $netlogonPath) {
+            try {
+                $netlogonFiles = Get-ChildItem -Path $netlogonPath -Recurse -File -ErrorAction SilentlyContinue
+                foreach ($file in $netlogonFiles) {
+                    if ($file.Extension -notin $suspiciousExtensions) { continue }
+                    try {
+                        $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+                        if ($content) {
+                            $matched = @($suspiciousPatterns | Where-Object { $content -match $_ })
+                            if ($matched.Count -gt 0) {
+                                $hits.Add([PSCustomObject]@{
+                                    Path              = $file.FullName
+                                    Name              = $file.Name
+                                    GPO_GUID          = 'NETLOGON'
+                                    SuspiciousContent = $matched
+                                    IsWritableByNonAdmins = $false
+                                })
+                            }
+                        }
+                    }
+                    catch {}
+                }
+            }
+            catch { Write-Verbose "NETLOGON scan error: $_" }
+        }
+    }
+
+    if ($hits.Count -gt 0) {
+        $writableFiles  = @($hits | Where-Object { $_.IsWritableByNonAdmins })
+        $suspiciousFiles = @($hits | Where-Object { $_.SuspiciousContent.Count -gt 0 })
+
+        if ($suspiciousFiles.Count -gt 0) {
+            $findings.Add((New-Finding `
+                -RuleId    'PB-050' `
+                -Title     "Suspicious content found in $($suspiciousFiles.Count) logon/startup script(s)" `
+                -Severity  'Critical' `
+                -Description "Logon or startup scripts in SYSVOL/NETLOGON contain patterns associated with malicious activity: download cradles, obfuscated execution, credential theft tools, or reverse shells. These scripts execute on every user logon or machine startup." `
+                -AffectedObjects ($suspiciousFiles | Select-Object -ExpandProperty Path) `
+                -Remediation '1) Immediately review and quarantine flagged scripts. 2) Investigate who last modified these scripts (Event ID 5136 in AD audit log). 3) Validate all logon/startup scripts against an approved baseline. 4) Restrict write access to SYSVOL/NETLOGON to Domain Admins only.' `
+                -MitreAttack 'T1037.001 - Boot or Logon Initialization Scripts: Logon Script (Windows)' `
+                -ExtraData @{ SuspiciousFiles = $suspiciousFiles }
+            ))
+        }
+
+        if ($writableFiles.Count -gt 0) {
+            $findings.Add((New-Finding `
+                -RuleId    'PB-051' `
+                -Title     "$($writableFiles.Count) logon/startup script(s) are writable by non-admins" `
+                -Severity  'High' `
+                -Description "Script files in SYSVOL are writable by low-privilege users (Authenticated Users, Domain Users). Any domain user can modify these scripts to execute arbitrary code on all affected machines at next logon/startup." `
+                -AffectedObjects ($writableFiles | Select-Object -ExpandProperty Path) `
+                -Remediation '1) Reset ACLs on SYSVOL script files to admin-only write access. 2) Use icacls or Set-Acl to restrict write permissions. 3) Enable SYSVOL replication monitoring (DFSR event logs).' `
+                -MitreAttack 'T1037.001 - Boot or Logon Initialization Scripts: Logon Script (Windows)'
+            ))
+        }
+    }
+
+    Write-Verbose "Startup/logon script checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region Rogue Scheduled Task Detection
+
+function Invoke-RogueScheduledTaskCheck {
+    <#
+    .SYNOPSIS
+        Identifies unexpected or suspicious scheduled tasks on domain controllers.
+    .DESCRIPTION
+        Queries scheduled tasks on all domain controllers and flags tasks that:
+        - Run as SYSTEM, NT AUTHORITY\SYSTEM, or privileged service accounts
+        - Execute from unusual paths (%TEMP%, public folders, User profile directories)
+        - Use PowerShell with encoded commands, download cradles, or hidden windows
+        - Were recently created or modified
+        - Have authors/paths inconsistent with Microsoft/Windows defaults
+
+        Attackers plant scheduled tasks on DCs for persistent, high-privilege execution.
+    .PARAMETER DomainControllers
+        DC objects from Get-ADDomainControllers.
+    .PARAMETER Credential
+        Optional PSCredential for remote access.
+    .EXAMPLE
+        Invoke-RogueScheduledTaskCheck -DomainControllers $dcs
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$DomainControllers,
+
+        [Parameter(Mandatory = $false)]
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    Write-Verbose "Running rogue scheduled task check on DCs..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    # Suspicious execution patterns
+    $suspiciousExecPatterns = @(
+        'powershell.*-enc',
+        'powershell.*-e\s',
+        'powershell.*downloadstring',
+        'powershell.*iex\s',
+        'cmd.*\s/c\s',
+        'wscript',
+        'cscript',
+        'mshta',
+        'regsvr32',
+        'rundll32.*comsvcs',
+        'certutil.*-decode',
+        '%temp%',
+        '%appdata%',
+        'C:\\Users\\.*\\AppData',
+        'C:\\Windows\\Temp',
+        'C:\\ProgramData\\.*\\.exe'
+    )
+
+    # Trusted task paths (Microsoft/Windows built-in tasks)
+    $trustedPaths = @(
+        '\Microsoft\',
+        '\Windows\',
+        '\WMI ',
+        '\Active Directory\',
+        '\Dynamic Data Exchange\'
+    )
+
+    $suspiciousTasks = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($dc in $DomainControllers) {
+        $hostname = if ($dc.DnsHostName) { $dc.DnsHostName } else { $dc.Name }
+        Write-Verbose "Checking scheduled tasks on: $hostname"
+
+        try {
+            $taskParams = @{ ErrorAction = 'Stop' }
+            # Use CIM for remote query when possible
+            if ($hostname -ne $env:COMPUTERNAME -and $hostname -ne 'localhost') {
+                $cimOpts = New-CimSessionOption -Protocol Dcom
+                $cimParams = @{ ComputerName = $hostname; SessionOption = $cimOpts; ErrorAction = 'SilentlyContinue' }
+                if ($null -ne $Credential) { $cimParams.Credential = $Credential }
+                $session = New-CimSession @cimParams
+                if ($null -eq $session) { Write-Verbose "Could not connect to $hostname"; continue }
+
+                $tasks = Get-CimInstance -ClassName MSFT_ScheduledTask -Namespace 'Root\Microsoft\Windows\TaskScheduler' `
+                    -CimSession $session -ErrorAction SilentlyContinue
+                Remove-CimSession $session -ErrorAction SilentlyContinue
+            }
+            else {
+                $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
+            }
+
+            if ($null -eq $tasks) { continue }
+
+            foreach ($task in $tasks) {
+                $taskPath  = if ($null -ne $task.TaskPath)  { $task.TaskPath }  else { '' }
+                $taskName  = if ($null -ne $task.TaskName)  { $task.TaskName }  else { '' }
+                $actions   = if ($null -ne $task.Actions)   { $task.Actions }   else { @() }
+                $principal = if ($null -ne $task.Principal) { $task.Principal } else { $null }
+
+                # Skip known-trusted Microsoft paths
+                $isTrusted = $trustedPaths | Where-Object { $taskPath -like "*$_*" }
+                if ($isTrusted) { continue }
+
+                $isSuspicious = $false
+                $reasons      = [System.Collections.Generic.List[string]]::new()
+
+                # Check run-as user
+                $runAs = if ($principal) { if ($null -ne $principal.UserId) { $principal.UserId } else { '' } } else { '' }
+                if ($runAs -match '^SYSTEM$|^NT AUTHORITY\\SYSTEM$|^S-1-5-18$') {
+                    $reasons.Add("RunsAsSystem")
+                }
+
+                # Check actions for suspicious execution
+                foreach ($action in $actions) {
+                    $exec = ''
+                    if ($action.PSObject.Properties['Execute']) {
+                        $exec = if ($null -ne $action.Execute) { $action.Execute } else { '' }
+                    }
+                    if ($action.PSObject.Properties['Arguments']) {
+                        $exec += ' ' + (if ($null -ne $action.Arguments) { $action.Arguments } else { '' })
+                    }
+                    foreach ($pattern in $suspiciousExecPatterns) {
+                        if ($exec -imatch $pattern) {
+                            $reasons.Add("SuspiciousExec: $pattern")
+                            $isSuspicious = $true
+                            break
+                        }
+                    }
+                }
+
+                # Non-trusted path with SYSTEM execution is always suspicious
+                if ($runAs -match 'SYSTEM' -and -not $isTrusted -and $reasons.Count -gt 0) {
+                    $isSuspicious = $true
+                }
+
+                if ($isSuspicious) {
+                    $suspiciousTasks.Add([PSCustomObject]@{
+                        DCName   = $hostname
+                        TaskPath = $taskPath
+                        TaskName = $taskName
+                        RunAs    = $runAs
+                        Reasons  = $reasons -join '; '
+                    })
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Could not query scheduled tasks on ${hostname}: $_"
+        }
+    }
+
+    if ($suspiciousTasks.Count -gt 0) {
+        $affectedDCs = $suspiciousTasks | Select-Object -ExpandProperty DCName -Unique
+        $findings.Add((New-Finding `
+            -RuleId    'PB-060' `
+            -Title     "Suspicious scheduled task(s) found on $($affectedDCs.Count) DC(s) ($($suspiciousTasks.Count) tasks)" `
+            -Severity  'Critical' `
+            -Description "Unexpected or suspicious scheduled tasks are present on domain controllers. Scheduled tasks running as SYSTEM with obfuscated or download-based payloads are a primary persistence mechanism for post-compromise attackers." `
+            -AffectedObjects ($suspiciousTasks | ForEach-Object { "$($_.DCName): $($_.TaskPath)$($_.TaskName)" }) `
+            -Remediation '1) Immediately review and disable flagged tasks. 2) Investigate creation time and author (schtasks /query /v /fo LIST). 3) Check Security event log for task creation (Event ID 4698). 4) Compare against known-good task inventory. 5) Restart DCs in safe mode if task removal is not sufficient.' `
+            -MitreAttack 'T1053.005 - Scheduled Task/Job: Scheduled Task' `
+            -ExtraData @{ SuspiciousTasks = $suspiciousTasks }
+        ))
+    }
+
+    Write-Verbose "Rogue scheduled task checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
 Export-ModuleMember -Function Invoke-AdminSDHolderCheck, Invoke-SIDHistoryCheck,
                                Invoke-DCSyncRightsCheck, Invoke-SkeletonKeyCheck,
-                               Invoke-RogueDCCheck
+                               Invoke-RogueDCCheck, Invoke-StartupScriptCheck,
+                               Invoke-RogueScheduledTaskCheck

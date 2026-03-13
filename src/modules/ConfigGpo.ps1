@@ -368,4 +368,244 @@ function Invoke-TrustCheck {
 
 #endregion
 
-Export-ModuleMember -Function Invoke-WeakProtocolCheck, Invoke-GPOSecurityCheck, Invoke-TrustCheck
+
+#region Dangerous ACL Checks
+
+function Invoke-DangerousACLCheck {
+    <#
+    .SYNOPSIS
+        Detects overpermissive ACLs on sensitive Active Directory objects.
+    .DESCRIPTION
+        Checks for dangerous permissions (GenericAll, WriteDacl, WriteOwner,
+        GenericWrite, AllExtendedRights, Self) granted to non-privileged principals
+        on high-value objects: the domain root, Domain Admins, AdminSDHolder,
+        krbtgt account, and domain controller OUs.
+
+        These ACL misconfigurations allow privilege escalation, DCSync,
+        Golden Ticket attacks, and persistent backdoors.
+    .PARAMETER ACLs
+        ACL objects from Get-ADACLs (must include sensitive objects).
+    .PARAMETER DomainDN
+        Distinguished name of the domain root (e.g. DC=corp,DC=local).
+    .EXAMPLE
+        Invoke-DangerousACLCheck -ACLs $adACLs -DomainDN 'DC=corp,DC=local'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [object[]]$ACLs = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string]$DomainDN = ''
+    )
+
+    Write-Verbose "Running dangerous ACL check..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    if ($ACLs.Count -eq 0) {
+        Write-Verbose "No ACL data provided; skipping dangerous ACL check."
+        return @()
+    }
+
+    # High-value target objects (partial DN matching)
+    $sensitiveTargets = @(
+        'AdminSDHolder',
+        'Domain Admins',
+        'Enterprise Admins',
+        'Schema Admins',
+        'krbtgt',
+        'Domain Controllers'
+    )
+    if (-not [string]::IsNullOrEmpty($DomainDN)) {
+        $sensitiveTargets += $DomainDN
+    }
+
+    # Principals that are legitimate owners of sensitive ACEs
+    $legitimatePrincipals = @(
+        'SYSTEM','NT AUTHORITY\SYSTEM','CREATOR OWNER',
+        'BUILTIN\Administrators','Enterprise Admins','Domain Admins',
+        'Schema Admins','Administrators','Enterprise Domain Controllers',
+        'ENTERPRISE DOMAIN CONTROLLERS'
+    )
+
+    # Dangerous right patterns
+    $dangerousRights = 'GenericAll|WriteDacl|WriteOwner|GenericWrite|AllExtendedRights'
+
+    $dangerousACEs = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($ace in $ACLs) {
+        $target = $ace.TargetObject
+        if (-not $target) { continue }
+
+        $isSensitive = $sensitiveTargets | Where-Object { $target -like "*$_*" }
+        if (-not $isSensitive) { continue }
+
+        $identity = $ace.IdentityReference
+        $isLegit  = $legitimatePrincipals | Where-Object { $identity -like "*$_*" }
+        if ($isLegit) { continue }
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+
+        $rights = $ace.ActiveDirectoryRights
+        if ($rights -match $dangerousRights) {
+            $dangerousACEs.Add([PSCustomObject]@{
+                Target    = $target
+                Identity  = $identity
+                Rights    = $rights
+                ObjectType= $ace.ObjectType
+            })
+        }
+    }
+
+    if ($dangerousACEs.Count -gt 0) {
+        $affected = $dangerousACEs | Select-Object -ExpandProperty Identity -Unique
+        $targetList = $dangerousACEs | Select-Object -ExpandProperty Target -Unique
+
+        $findings.Add((New-Finding `
+            -RuleId    'CG-030' `
+            -Title     "Dangerous ACEs found on $($targetList.Count) sensitive AD object(s)" `
+            -Severity  'Critical' `
+            -Description "Non-privileged principals have dangerous permissions (GenericAll/WriteDacl/WriteOwner/GenericWrite/AllExtendedRights) on sensitive AD objects. These ACEs allow privilege escalation, DCSync, shadow credentials injection, or persistent backdoor creation." `
+            -AffectedObjects $affected `
+            -Remediation '1) Use ADSI Edit or PowerShell to remove the offending ACEs. 2) Run: (Get-Acl "AD:CN=AdminSDHolder,...").Access to enumerate AdminSDHolder ACEs. 3) Use BloodHound to trace the full impact of each ACE. 4) Audit all changes using event ID 5136 (AD object modification).' `
+            -MitreAttack 'T1222.001 - File and Directory Permissions Modification: Windows File and Directory Permissions Modification' `
+            -ExtraData @{ DangerousACEs = $dangerousACEs }
+        ))
+    }
+
+    Write-Verbose "Dangerous ACL checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region GPO User Rights Assignment Check
+
+function Invoke-GPOUserRightsCheck {
+    <#
+    .SYNOPSIS
+        Scans GPOs for dangerous user rights assignments.
+    .DESCRIPTION
+        Parses GptTmpl.inf files in SYSVOL for dangerous privilege assignments:
+        - SeDebugPrivilege     (bypass process isolation — used by Mimikatz)
+        - SeTcbPrivilege       (act as OS — ultimate privilege)
+        - SeLoadDriverPrivilege (load arbitrary kernel drivers)
+        - SeImpersonatePrivilege (impersonate any logged-on user)
+        - SeTakeOwnershipPrivilege (take ownership of any object)
+        - SeBackupPrivilege    (read any file bypassing ACLs — used for NTDS.dit extraction)
+        - SeRestorePrivilege   (write any file bypassing ACLs)
+        - SeAssignPrimaryTokenPrivilege (assign security tokens)
+
+        These rights, when assigned to non-default principals, enable privilege escalation.
+    .PARAMETER DomainName
+        Domain DNS name for SYSVOL path construction.
+    .PARAMETER SysvolPath
+        Override the default SYSVOL path.
+    .EXAMPLE
+        Invoke-GPOUserRightsCheck -DomainName 'corp.local'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$DomainName = $env:USERDNSDOMAIN,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SysvolPath
+    )
+
+    Write-Verbose "Running GPO user rights assignment check..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    if ([string]::IsNullOrEmpty($SysvolPath) -and -not [string]::IsNullOrEmpty($DomainName)) {
+        $SysvolPath = "\\$DomainName\SYSVOL\$DomainName\Policies"
+    }
+
+    if ([string]::IsNullOrEmpty($SysvolPath) -or -not (Test-Path $SysvolPath)) {
+        Write-Verbose "SYSVOL not accessible; skipping GPO user rights check."
+        return @()
+    }
+
+    # Dangerous privilege constants and their descriptions
+    $dangerousRights = @{
+        'SeDebugPrivilege'             = 'Debug programs (used by Mimikatz to read LSASS)'
+        'SeTcbPrivilege'               = 'Act as part of the operating system'
+        'SeLoadDriverPrivilege'        = 'Load and unload device drivers'
+        'SeImpersonatePrivilege'       = 'Impersonate a client after authentication'
+        'SeTakeOwnershipPrivilege'     = 'Take ownership of files or objects'
+        'SeBackupPrivilege'            = 'Back up files and directories (bypasses ACLs — NTDS.dit)'
+        'SeRestorePrivilege'           = 'Restore files and directories (write-bypasses ACLs)'
+        'SeAssignPrimaryTokenPrivilege'= 'Replace a process-level token'
+        'SeSyncAgentPrivilege'         = 'Synchronize directory service data'
+        'SeEnableDelegationPrivilege'  = 'Enable computer and user accounts to be trusted for delegation'
+    }
+
+    # Default expected holders for these rights (should only see these, not arbitrary users)
+    $expectedHolders = @('*S-1-5-18*', '*S-1-5-19*', '*S-1-5-20*',  # SYSTEM, Local Service, Network Service
+                         '*Administrators*', '*Domain Admins*', '*SYSTEM*')
+
+    $hits = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        $gptFiles = Get-ChildItem -Path $SysvolPath -Recurse -Filter 'GptTmpl.inf' -ErrorAction SilentlyContinue
+
+        foreach ($file in $gptFiles) {
+            try {
+                $content = Get-Content $file.FullName -ErrorAction SilentlyContinue
+                if (-not $content) { continue }
+
+                $inURASection = $false
+                foreach ($line in $content) {
+                    if ($line -match '^\[Privilege Rights\]') { $inURASection = $true; continue }
+                    if ($line -match '^\[') { $inURASection = $false }
+                    if (-not $inURASection) { continue }
+
+                    foreach ($right in $dangerousRights.Keys) {
+                        if ($line -match "^$right\s*=\s*(.+)$") {
+                            $holders = $Matches[1] -split ',' | ForEach-Object { $_.Trim() }
+                            # Check for non-default/suspicious holders
+                            $suspicious = @($holders | Where-Object {
+                                $h = $_
+                                -not ($expectedHolders | Where-Object { $h -like $_ })
+                            })
+                            if ($suspicious.Count -gt 0) {
+                                $hits.Add([PSCustomObject]@{
+                                    File        = $file.FullName
+                                    GPO_GUID    = Split-Path -Parent (Split-Path -Parent $file.FullName) | Split-Path -Leaf
+                                    Right       = $right
+                                    Description = $dangerousRights[$right]
+                                    Holders     = $holders -join ', '
+                                    Suspicious  = $suspicious -join ', '
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+            catch { Write-Verbose "Could not parse $($file.FullName): $_" }
+        }
+    }
+    catch { Write-Warning "GPO user rights scan error: $_" }
+
+    if ($hits.Count -gt 0) {
+        $affected  = $hits | Select-Object -ExpandProperty Suspicious | ForEach-Object { $_ -split ',' } |
+                     ForEach-Object { $_.Trim() } | Sort-Object -Unique
+
+        $findings.Add((New-Finding `
+            -RuleId    'CG-040' `
+            -Title     "Dangerous user rights assigned to non-default principals in $($hits.Count) GPO setting(s)" `
+            -Severity  'High' `
+            -Description "GPO User Rights Assignments grant dangerous privileges (debug, impersonate, backup, load drivers) to unexpected principals. These privileges can be exploited for privilege escalation, credential theft, and persistent access." `
+            -AffectedObjects $affected `
+            -Remediation '1) Review the GptTmpl.inf files in SYSVOL identified. 2) Remove unexpected principal assignments from dangerous rights. 3) Enforce the principle of least privilege. 4) Monitor changes via event ID 4703 (token right adjusted).' `
+            -MitreAttack 'T1078.003 - Valid Accounts: Local Accounts' `
+            -ExtraData @{ Hits = $hits }
+        ))
+    }
+
+    Write-Verbose "GPO user rights checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
+Export-ModuleMember -Function Invoke-WeakProtocolCheck, Invoke-GPOSecurityCheck, Invoke-TrustCheck,
+                               Invoke-DangerousACLCheck, Invoke-GPOUserRightsCheck

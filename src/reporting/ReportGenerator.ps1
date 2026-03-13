@@ -127,8 +127,10 @@ function New-HTMLReport {
             $safeTitle    = ConvertTo-HtmlSafe $f.Title
             $safeDesc     = ConvertTo-HtmlSafe $f.Description
             $safeRemed    = ConvertTo-HtmlSafe $f.Remediation
+            $safeVerif    = if ($f.VerificationCommand) { ConvertTo-HtmlSafe $f.VerificationCommand } else { '' }
             $affectedHtml = Format-AffectedList $f.AffectedObjects
             $mitre        = if ($f.MitreAttack) { "<a href='https://attack.mitre.org/techniques/$(($f.MitreAttack -split ' ')[0].Replace('.','/'))' target='_blank'>$($f.MitreAttack)</a>" } else { 'N/A' }
+            $verifRow     = if ($safeVerif) { "<tr><td><strong>Verification</strong></td><td><code class='verif-cmd'>$safeVerif</code></td></tr>" } else { '' }
 
             [void]$findingsHtml.AppendLine(@"
 <div class='finding-card' id='$($f.RuleId)'>
@@ -143,6 +145,7 @@ function New-HTMLReport {
       <tr><td><strong>Affected ($($f.AffectedCount))</strong></td><td>$affectedHtml</td></tr>
       <tr><td><strong>Description</strong></td><td>$safeDesc</td></tr>
       <tr><td><strong>Remediation</strong></td><td>$safeRemed</td></tr>
+      $verifRow
       <tr><td><strong>MITRE ATT&amp;CK</strong></td><td>$mitre</td></tr>
     </table>
   </div>
@@ -202,6 +205,7 @@ function New-HTMLReport {
   .finding-table { width:100%; border-collapse:collapse; font-size:0.88em; }
   .finding-table td { padding:8px 16px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
   .finding-table td:first-child { font-weight:bold; width:140px; color:#555; white-space:nowrap; }
+  .verif-cmd { display:block; background:#1e1e1e; color:#4ec9b0; font-family:monospace; font-size:0.85em; padding:8px 12px; border-radius:4px; white-space:pre-wrap; word-break:break-all; }
   .badge { display:inline-block; }
   .table { width:100%; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.1); font-size:0.88em; }
   .table th { background:var(--primary); color:#fff; padding:10px 12px; text-align:left; }
@@ -551,6 +555,13 @@ function New-MarkdownReport {
             [void]$md.AppendLine()
             [void]$md.AppendLine("**Remediation:** $($f.Remediation)")
             [void]$md.AppendLine()
+            if (-not [string]::IsNullOrEmpty($f.VerificationCommand)) {
+                [void]$md.AppendLine("**Verification (run after remediation):**")
+                [void]$md.AppendLine("``````powershell")
+                [void]$md.AppendLine($f.VerificationCommand)
+                [void]$md.AppendLine("``````")
+                [void]$md.AppendLine()
+            }
             if ($f.AffectedObjects.Count -gt 0) {
                 [void]$md.AppendLine("**Sample Affected Objects:**")
                 $f.AffectedObjects | Select-Object -First 5 | ForEach-Object {

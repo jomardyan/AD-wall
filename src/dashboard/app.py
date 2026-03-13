@@ -239,6 +239,145 @@ def api_export():
     )
 
 
+@app.route("/api/export/cef")
+def api_export_cef():
+    """Export findings as CEF (Common Event Format) for SIEM ingestion."""
+    assessment = _latest_assessment()
+    if not assessment:
+        abort(404)
+
+    findings = _get_findings(assessment)
+    severity_map = {"Critical": 10, "High": 8, "Medium": 5, "Low": 3, "Informational": 1}
+
+    lines = []
+    for f in findings:
+        sev     = severity_map.get(f.get("Severity", ""), 1)
+        rule_id = (f.get("RuleId") or "UNKNOWN").replace("|", "/")
+        title   = (f.get("Title") or "").replace("|", "/")
+        desc    = (f.get("Description") or "").replace("|", "/").replace("\n", " ")
+        remedi  = (f.get("Remediation") or "").replace("|", "/").replace("\n", " ")
+        mitre   = (f.get("MitreAttack") or "").replace("|", "/")
+        aff_cnt = f.get("AffectedCount", 0)
+        det_at  = f.get("DetectedAt", "")
+        ext = f"msg={desc} act={remedi} cs1={mitre} cs1Label=MitreAttack cnt={aff_cnt} rt={det_at}"
+        lines.append(f"CEF:0|AD-Wall|AD-Wall|1.0.0|{rule_id}|{title}|{sev}|{ext}")
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        io.BytesIO("\n".join(lines).encode("utf-8")),
+        mimetype="text/plain",
+        as_attachment=True,
+        download_name=f"ADWall_SIEM_{timestamp}.cef",
+    )
+
+
+@app.route("/api/export/splunk")
+def api_export_splunk():
+    """Export findings as Splunk HEC-compatible NDJSON."""
+    import time
+    assessment = _latest_assessment()
+    if not assessment:
+        abort(404)
+
+    findings = _get_findings(assessment)
+    source_type = request.args.get("sourcetype", "adwall:finding")
+    index = request.args.get("index", "security")
+
+    events = []
+    epoch = time.time()
+    for f in findings:
+        event = {
+            "time": round(epoch, 3),
+            "sourcetype": source_type,
+            "index": index,
+            "source": "ADWall",
+            "event": {
+                "rule_id": f.get("RuleId"),
+                "title": f.get("Title"),
+                "severity": f.get("Severity"),
+                "category": f.get("Category"),
+                "description": f.get("Description"),
+                "affected_objects": f.get("AffectedObjects"),
+                "affected_count": f.get("AffectedCount"),
+                "remediation": f.get("Remediation"),
+                "mitre_attack": f.get("MitreAttack"),
+                "detected_at": f.get("DetectedAt"),
+                "verification_command": f.get("VerificationCommand", ""),
+            }
+        }
+        events.append(json.dumps(event))
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        io.BytesIO("\n".join(events).encode("utf-8")),
+        mimetype="application/json",
+        as_attachment=True,
+        download_name=f"ADWall_Splunk_{timestamp}.json",
+    )
+
+
+@app.route("/api/fix-guide/<rule_id>")
+def api_fix_guide(rule_id: str):
+    """Return the full fix guide for a specific finding by RuleId."""
+    assessment = _latest_assessment()
+    if not assessment:
+        abort(404)
+
+    findings = _get_findings(assessment)
+    finding = next((f for f in findings if f.get("RuleId") == rule_id), None)
+    if not finding:
+        abort(404)
+
+    # Verification commands index (mirrors WorkflowExport.ps1)
+    verification_commands = {
+        "IP-001": 'Get-ADGroupMember -Identity "Domain Admins" -Recursive | Select-Object SamAccountName, objectClass',
+        "IP-003": 'Get-ADGroupMember -Identity "Schema Admins" | Select-Object SamAccountName',
+        "IP-010": 'Get-ADDefaultDomainPasswordPolicy | Select-Object MinPasswordLength, ComplexityEnabled, LockoutThreshold',
+        "IP-015": 'Get-ADUser -Filter {PasswordNeverExpires -eq $true -and Enabled -eq $true} | Select-Object SamAccountName',
+        "IP-016": 'Get-ADUser -Filter {PasswordNotRequired -eq $true -and Enabled -eq $true} | Select-Object SamAccountName',
+        "IP-017": 'Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true -and Enabled -eq $true} | Select-Object SamAccountName',
+        "IP-030": 'Get-ADUser -Filter {TrustedForDelegation -eq $true} | Select-Object SamAccountName, TrustedForDelegation',
+        "IP-031": 'Get-ADComputer -Filter {TrustedForDelegation -eq $true} | Select-Object SamAccountName',
+        "IP-040": 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null" -and Enabled -eq $true} | Select-Object SamAccountName, ServicePrincipalNames',
+        "IP-050": 'Get-ADGroup -Filter {Name -eq "Domain Admins"} | Get-ADGroupMember -Recursive | Select-Object SamAccountName, objectClass',
+        "IP-060": 'Get-ADUser -LDAPFilter "(userAccountControl:1.2.840.113556.1.4.803:=2097152)" | Select-Object SamAccountName, UserAccountControl',
+        "CG-001": 'Get-SmbServerConfiguration | Select-Object RequireSecuritySignature, EnableSecuritySignature',
+        "CG-002": 'Get-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters" -Name "LDAPServerIntegrity"',
+        "CG-004": 'Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol | Select-Object FeatureName, State',
+        "CG-005": 'Get-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa" -Name "LmCompatibilityLevel"',
+        "CG-010": 'Get-ChildItem -Path "\\\\$env:USERDNSDOMAIN\\SYSVOL" -Recurse -Filter "*.xml" | Select-String "cpassword"',
+        "CG-020": 'Get-ADTrust -Filter * | Select-Object Name, TrustAttributes, SIDFilteringForestAware',
+        "CG-030": '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" }',
+        "CG-040": 'Get-ChildItem "\\\\$env:USERDNSDOMAIN\\SYSVOL" -Recurse -Filter "GptTmpl.inf" | Select-String "SeDebugPrivilege"',
+        "EV-010": 'Get-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters" -Name "FullSecureChannelProtection"',
+        "EV-020": 'Get-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters" -Name "LdapEnforceChannelBinding"',
+        "EV-030": 'Get-Service -ComputerName (Get-ADDomainController -Filter *).HostName -Name "Spooler" | Select-Object MachineName, Status',
+        "PB-001": '(Get-ACL "AD:CN=AdminSDHolder,CN=System,DC=corp,DC=local").Access | Select-Object IdentityReference, ActiveDirectoryRights',
+        "PB-010": 'Get-ADUser -Filter * -Properties SIDHistory | Where-Object { $_.SIDHistory } | Select-Object SamAccountName, SIDHistory',
+        "PB-020": '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" }',
+        "PB-050": 'Get-ChildItem "\\\\$env:USERDNSDOMAIN\\NETLOGON" | Select-Object Name, LastWriteTime, Attributes',
+        "PB-060": 'Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "*\\Microsoft\\*" -and $_.Principal.UserId -match "SYSTEM" }',
+        "DE-001": 'auditpol /get /category:"Account Logon","Logon/Logoff","DS Access","Account Management","Privilege Use","Policy Change"',
+        "DE-002": 'Get-WinEvent -ListLog Security | Select-Object LogName, MaximumSizeInBytes, RecordCount',
+    }
+
+    return jsonify({
+        "ruleId": finding.get("RuleId"),
+        "title": finding.get("Title"),
+        "severity": finding.get("Severity"),
+        "category": finding.get("Category"),
+        "whyItMatters": finding.get("Description"),
+        "affectedObjects": finding.get("AffectedObjects", []),
+        "affectedCount": finding.get("AffectedCount", 0),
+        "remediationSteps": finding.get("Remediation"),
+        "verificationCommand": (
+            finding.get("VerificationCommand")
+            or verification_commands.get(rule_id, f"# No verification command for {rule_id}")
+        ),
+        "mitreAttack": finding.get("MitreAttack"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

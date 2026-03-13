@@ -66,6 +66,20 @@ $Script:RuleCatalog = @(
     [PSCustomObject]@{ RuleId='PB-030'; Category='Persistence & Backdoor'; Name='Skeleton Key Indicators';            Severity='Critical'; MitreAttack='T1556.001'; Enabled=$true }
     [PSCustomObject]@{ RuleId='PB-040'; Category='Persistence & Backdoor'; Name='Potential Rogue DC in DNS';          Severity='High';     MitreAttack='T1207';     Enabled=$true }
     [PSCustomObject]@{ RuleId='PB-041'; Category='Persistence & Backdoor'; Name='RODC Present';                       Severity='Informational'; MitreAttack='';   Enabled=$true }
+    [PSCustomObject]@{ RuleId='PB-050'; Category='Persistence & Backdoor'; Name='Suspicious Logon/Startup Script Content';  Severity='Critical'; MitreAttack='T1037.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='PB-051'; Category='Persistence & Backdoor'; Name='Logon/Startup Script Writable by Non-Admins'; Severity='High'; MitreAttack='T1037.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='PB-060'; Category='Persistence & Backdoor'; Name='Rogue Scheduled Task on DC';         Severity='Critical'; MitreAttack='T1053.005'; Enabled=$true }
+    # Identity & Privilege (new)
+    [PSCustomObject]@{ RuleId='IP-050'; Category='Identity & Privilege'; Name='Nested Privileged Group Membership';   Severity='High';     MitreAttack='T1078.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='IP-060'; Category='Identity & Privilege'; Name='UseDESKeyOnly (Kerberos DES)';         Severity='Critical'; MitreAttack='T1558.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='IP-061'; Category='Identity & Privilege'; Name='No AES Kerberos Encryption (Users)';   Severity='Medium';   MitreAttack='T1558.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='IP-062'; Category='Identity & Privilege'; Name='No AES Kerberos Encryption (Computers)'; Severity='Medium'; MitreAttack='T1558';     Enabled=$true }
+    # Configuration & GPO (new)
+    [PSCustomObject]@{ RuleId='CG-030'; Category='Configuration & GPO'; Name='Dangerous ACEs on Sensitive AD Objects'; Severity='Critical'; MitreAttack='T1222.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='CG-040'; Category='Configuration & GPO'; Name='Dangerous User Rights in GPO';          Severity='High';     MitreAttack='T1078.003'; Enabled=$true }
+    # Detection Engineering (new)
+    [PSCustomObject]@{ RuleId='DE-001'; Category='Detection Engineering'; Name='Missing Windows Audit Policies';      Severity='High';     MitreAttack='T1562.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='DE-002'; Category='Detection Engineering'; Name='Insufficient SIEM Log Coverage';      Severity='High';     MitreAttack='T1562.002'; Enabled=$true }
 )
 
 #endregion
@@ -146,8 +160,8 @@ function Invoke-AllChecks {
         [hashtable]$CollectedData,
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet('Identity','Config','Exploit','Persistence')]
-        [string[]]$Modules = @('Identity','Config','Exploit','Persistence'),
+        [ValidateSet('Identity','Config','Exploit','Persistence','Detection')]
+        [string[]]$Modules = @('Identity','Config','Exploit','Persistence','Detection'),
 
         [string]$DomainName = $env:USERDNSDOMAIN
     )
@@ -180,13 +194,15 @@ function Invoke-AllChecks {
         try {
             $ipFindings = @()
             if ($users.Count -gt 0 -and $groups.Count -gt 0) {
-                $ipFindings += Invoke-PrivilegedGroupCheck -Users $users -Groups $groups
+                $ipFindings += Invoke-PrivilegedGroupCheck      -Users $users -Groups $groups
+                $ipFindings += Invoke-NestedPrivilegedGroupCheck -Groups $groups -Users $users
             }
             if ($users.Count -gt 0) {
-                $ipFindings += Invoke-PasswordPolicyCheck -Users $users -PasswordPolicies $pwPolicies
-                $ipFindings += Invoke-StaleAccountCheck   -Users $users -Computers $computers
-                $ipFindings += Invoke-DelegationCheck     -Users $users -Computers $computers -DomainControllers $dcs
-                $ipFindings += Invoke-KerberoastableCheck -Users $users
+                $ipFindings += Invoke-PasswordPolicyCheck       -Users $users -PasswordPolicies $pwPolicies
+                $ipFindings += Invoke-StaleAccountCheck         -Users $users -Computers $computers
+                $ipFindings += Invoke-DelegationCheck           -Users $users -Computers $computers -DomainControllers $dcs
+                $ipFindings += Invoke-KerberoastableCheck       -Users $users
+                $ipFindings += Invoke-WeakEncryptionTypeCheck   -Users $users -Computers $computers
             }
             $ipFindings | ForEach-Object { $allFindings.Add($_) }
         }
@@ -205,6 +221,10 @@ function Invoke-AllChecks {
             if ($trusts.Count -gt 0) {
                 $cgFindings += Invoke-TrustCheck -Trusts $trusts
             }
+            if ($acls.Count -gt 0) {
+                $cgFindings += Invoke-DangerousACLCheck -ACLs $acls
+            }
+            $cgFindings += Invoke-GPOUserRightsCheck -DomainName $DomainName
             $cgFindings | ForEach-Object { $allFindings.Add($_) }
         }
         catch { Write-Warning "Config module error: $_" }
@@ -244,12 +264,28 @@ function Invoke-AllChecks {
                 $pbFindings += Invoke-DCSyncRightsCheck  -ACLs $acls
             }
             if ($dcs.Count -gt 0) {
-                $pbFindings += Invoke-SkeletonKeyCheck   -DomainControllers $dcs
-                $pbFindings += Invoke-RogueDCCheck       -DomainControllers $dcs -DomainName $DomainName
+                $pbFindings += Invoke-SkeletonKeyCheck         -DomainControllers $dcs
+                $pbFindings += Invoke-RogueDCCheck             -DomainControllers $dcs -DomainName $DomainName
+                $pbFindings += Invoke-RogueScheduledTaskCheck  -DomainControllers $dcs
             }
+            $pbFindings += Invoke-StartupScriptCheck -DomainName $DomainName -GPOs $gpos
             $pbFindings | ForEach-Object { $allFindings.Add($_) }
         }
         catch { Write-Warning "Persistence module error: $_" }
+    }
+
+    # Detection Engineering
+    if ('Detection' -in $Modules) {
+        Write-Verbose "=== Running Detection Engineering checks ==="
+        try {
+            $deFindings  = @()
+            if ($dcs.Count -gt 0) {
+                $deFindings += Invoke-AuditPolicyCheck   -DomainControllers $dcs
+                $deFindings += Invoke-SIEMCoverageCheck  -DomainControllers $dcs
+            }
+            $deFindings | ForEach-Object { $allFindings.Add($_) }
+        }
+        catch { Write-Warning "Detection Engineering module error: $_" }
     }
 
     # Enrich with rule metadata and deduplicate
@@ -263,13 +299,48 @@ function Invoke-AllChecks {
 function Invoke-FindingEnrichment {
     <#
     .SYNOPSIS
-        Enriches findings with matching rule catalog metadata.
+        Enriches findings with matching rule catalog metadata and verification commands.
     #>
     param([object[]]$Findings)
 
     $ruleIndex = @{}
     foreach ($rule in $Script:RuleCatalog) {
         $ruleIndex[$rule.RuleId] = $rule
+    }
+
+    # Verification command lookup (PowerShell to run after remediation to confirm the fix)
+    $verificationCommands = @{
+        'IP-001' = 'Get-ADGroupMember -Identity "Domain Admins" -Recursive | Select-Object SamAccountName, objectClass'
+        'IP-003' = 'Get-ADGroupMember -Identity "Schema Admins" | Select-Object SamAccountName'
+        'IP-010' = 'Get-ADDefaultDomainPasswordPolicy | Select-Object MinPasswordLength, ComplexityEnabled, LockoutThreshold'
+        'IP-015' = 'Get-ADUser -Filter {PasswordNeverExpires -eq $true -and Enabled -eq $true} | Select-Object SamAccountName'
+        'IP-016' = 'Get-ADUser -Filter {PasswordNotRequired -eq $true -and Enabled -eq $true} | Select-Object SamAccountName'
+        'IP-017' = 'Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true -and Enabled -eq $true} | Select-Object SamAccountName'
+        'IP-030' = 'Get-ADUser -Filter {TrustedForDelegation -eq $true} | Select-Object SamAccountName, TrustedForDelegation'
+        'IP-031' = 'Get-ADComputer -Filter {TrustedForDelegation -eq $true} | Where-Object { $_.Name -notin (Get-ADDomainController -Filter *).Name } | Select-Object SamAccountName'
+        'IP-040' = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null" -and Enabled -eq $true} | Select-Object SamAccountName, ServicePrincipalNames'
+        'IP-050' = 'Get-ADGroup -Filter {Name -eq "Domain Admins"} | Get-ADGroupMember -Recursive | Select-Object SamAccountName, objectClass'
+        'IP-060' = 'Get-ADUser -LDAPFilter "(userAccountControl:1.2.840.113556.1.4.803:=2097152)" | Select-Object SamAccountName, UserAccountControl'
+        'IP-061' = 'Get-ADUser -Filter * -Properties msDS-SupportedEncryptionTypes | Where-Object { $_."msDS-SupportedEncryptionTypes" -gt 0 -and -not ($_."msDS-SupportedEncryptionTypes" -band 24) } | Select-Object SamAccountName, "msDS-SupportedEncryptionTypes"'
+        'CG-001' = 'Get-SmbServerConfiguration | Select-Object RequireSecuritySignature, EnableSecuritySignature'
+        'CG-002' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LDAPServerIntegrity"'
+        'CG-004' = 'Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol | Select-Object FeatureName, State'
+        'CG-005' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel"'
+        'CG-010' = 'Get-ChildItem -Path "\\$env:USERDNSDOMAIN\SYSVOL" -Recurse -Filter "*.xml" | Select-String "cpassword"'
+        'CG-020' = 'Get-ADTrust -Filter * | Select-Object Name, TrustAttributes, SIDFilteringForestAware'
+        'CG-030' = '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference, ActiveDirectoryRights'
+        'CG-040' = 'Get-ChildItem "\\$env:USERDNSDOMAIN\SYSVOL" -Recurse -Filter "GptTmpl.inf" | Select-String "SeDebugPrivilege|SeTcbPrivilege"'
+        'EV-001' = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null"} | Select-Object SamAccountName, ServicePrincipalNames, PasswordLastSet'
+        'EV-010' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "FullSecureChannelProtection"'
+        'EV-020' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LdapEnforceChannelBinding"'
+        'EV-030' = 'Get-Service -ComputerName (Get-ADDomainController -Filter *).HostName -Name "Spooler" | Select-Object MachineName, Status'
+        'PB-001' = '(Get-ACL "AD:CN=AdminSDHolder,CN=System,DC=corp,DC=local").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl" } | Select-Object IdentityReference'
+        'PB-010' = 'Get-ADUser -Filter * -Properties SIDHistory | Where-Object { $_.SIDHistory } | Select-Object SamAccountName, SIDHistory'
+        'PB-020' = '(Get-ACL "AD:DC=corp,DC=local").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" } | Select-Object IdentityReference'
+        'PB-050' = 'Get-ChildItem "\\$env:USERDNSDOMAIN\NETLOGON" | Select-Object Name, LastWriteTime, Attributes'
+        'PB-060' = 'Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "*\Microsoft\*" -and $_.Principal.UserId -match "SYSTEM" } | Select-Object TaskName, TaskPath, @{N="RunAs";E={$_.Principal.UserId}}'
+        'DE-001' = 'auditpol /get /category:"Account Logon","Logon/Logoff","DS Access","Account Management","Privilege Use","Policy Change","Detailed Tracking"'
+        'DE-002' = 'Get-WinEvent -ListLog Security | Select-Object LogName, MaximumSizeInBytes, RecordCount'
     }
 
     foreach ($finding in $Findings) {
@@ -279,6 +350,12 @@ function Invoke-FindingEnrichment {
             $finding | Add-Member -NotePropertyName 'RuleEnabled'    -NotePropertyValue $rule.Enabled     -Force
             $finding | Add-Member -NotePropertyName 'MitreReference' -NotePropertyValue $rule.MitreAttack -Force
         }
+
+        # Add verification command if available
+        $verCmd = if ($null -ne $finding.RuleId -and $verificationCommands.ContainsKey($finding.RuleId)) {
+            $verificationCommands[$finding.RuleId]
+        } else { '' }
+        $finding | Add-Member -NotePropertyName 'VerificationCommand' -NotePropertyValue $verCmd -Force
     }
 
     return $Findings

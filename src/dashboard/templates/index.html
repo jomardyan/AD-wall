@@ -106,6 +106,8 @@
       <i class="bi bi-bug"></i><span>Exploits &amp; Vulns</span></a>
     <a href="#" data-page="persistence">
       <i class="bi bi-eye-slash"></i><span>Persistence</span></a>
+    <a href="#" data-page="detection">
+      <i class="bi bi-radar"></i><span>Detection Eng.</span></a>
     <a href="#" data-page="drift">
       <i class="bi bi-graph-up-arrow"></i><span>Drift Analysis</span></a>
   </nav>
@@ -120,8 +122,15 @@
       <small class="text-muted" id="lastUpdated"></small>
       <button class="btn btn-sm btn-outline-secondary" onclick="refreshData()">
         <i class="bi bi-arrow-clockwise"></i> Refresh</button>
-      <a href="/api/export" class="btn btn-sm btn-outline-primary">
-        <i class="bi bi-download"></i> Export CSV</a>
+      <div class="dropdown">
+        <button class="btn btn-sm btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+          <i class="bi bi-download"></i> Export</button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><a class="dropdown-item" href="/api/export"><i class="bi bi-file-earmark-spreadsheet me-2"></i>CSV</a></li>
+          <li><a class="dropdown-item" href="/api/export/cef"><i class="bi bi-broadcast me-2"></i>CEF (SIEM)</a></li>
+          <li><a class="dropdown-item" href="/api/export/splunk"><i class="bi bi-lightning me-2"></i>Splunk JSON</a></li>
+        </ul>
+      </div>
     </div>
   </div>
 
@@ -200,6 +209,7 @@
     <div id="page-config"     class="page-section"><div id="findingsConfig"></div></div>
     <div id="page-exploits"   class="page-section"><div id="findingsExploits"></div></div>
     <div id="page-persistence" class="page-section"><div id="findingsPersistence"></div></div>
+    <div id="page-detection"  class="page-section"><div id="findingsDetection"></div></div>
 
     <!-- ====== DRIFT ANALYSIS ====== -->
     <div id="page-drift" class="page-section">
@@ -213,6 +223,24 @@
 
   </div><!-- /content -->
 </div><!-- /main -->
+
+<!-- Fix Guide Modal -->
+<div class="modal fade" id="fixGuideModal" tabindex="-1" aria-labelledby="fixGuideModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="fixGuideModalLabel"><i class="bi bi-tools me-2"></i>Fix Guide</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="fixGuideBody">
+        <div class="text-center py-4"><div class="spinner-border text-primary" role="status"></div></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
@@ -236,16 +264,18 @@ const CATEGORY_MAP = {
   'identity':    'Identity & Privilege',
   'config':      'Configuration & GPO',
   'exploits':    'Exploit & Vulnerability',
-  'persistence': 'Persistence & Backdoor'
+  'persistence': 'Persistence & Backdoor',
+  'detection':   'Detection Engineering'
 };
 
 const PAGE_TITLES = {
-  overview: 'Overview',
-  identity: 'Identity & Privilege',
-  config: 'Configuration & GPO',
-  exploits: 'Exploits & Vulnerabilities',
+  overview:    'Overview',
+  identity:    'Identity & Privilege',
+  config:      'Configuration & GPO',
+  exploits:    'Exploits & Vulnerabilities',
   persistence: 'Persistence & Backdoor',
-  drift: 'Drift Analysis'
+  detection:   'Detection Engineering',
+  drift:       'Drift Analysis'
 };
 
 // ---------------------------------------------------------------------------
@@ -261,7 +291,7 @@ document.querySelectorAll('#sidebar nav a').forEach(link => {
     document.getElementById('page-' + page).classList.add('active');
     document.getElementById('pageTitle').textContent = PAGE_TITLES[page] || page;
     if (page === 'drift') loadDrift();
-    if (['identity','config','exploits','persistence'].includes(page)) renderCategoryPage(page);
+    if (['identity','config','exploits','persistence','detection'].includes(page)) renderCategoryPage(page);
   });
 });
 
@@ -392,10 +422,12 @@ function renderTopFindings() {
         <div class="p-3">
           <p class="mb-1"><strong>Description:</strong> ${esc(f.Description||'')}</p>
           <p class="mb-1"><strong>Remediation:</strong> ${esc(f.Remediation||'')}</p>
-          <p class="mb-0"><strong>MITRE ATT&CK:</strong> ${esc(f.MitreAttack||'N/A')}</p>
+          <p class="mb-1"><strong>MITRE ATT&CK:</strong> ${esc(f.MitreAttack||'N/A')}</p>
           ${f.AffectedObjects && f.AffectedObjects.length > 0 ?
-            '<p class="mb-0 mt-1"><strong>Sample affected:</strong> ' +
+            '<p class="mb-1"><strong>Sample affected:</strong> ' +
             f.AffectedObjects.slice(0,5).map(a=>'<code>'+esc(String(a))+'</code>').join(', ') + '</p>' : ''}
+          <button class="btn btn-sm btn-outline-info mt-1" onclick="event.stopPropagation();showFixGuide('${esc(f.RuleId||'')}')">
+            <i class="bi bi-tools me-1"></i>Fix Guide</button>
         </div>
       </td>
     </tr>`).join('');
@@ -447,8 +479,10 @@ function renderCategoryPage(page) {
                 <p class="mb-1"><strong>Description:</strong> ${esc(f.Description||'')}</p>
                 <p class="mb-1"><strong>Remediation:</strong> ${esc(f.Remediation||'')}</p>
                 ${f.AffectedObjects && f.AffectedObjects.length > 0 ?
-                  '<p class="mb-0"><strong>Affected:</strong> ' +
+                  '<p class="mb-1"><strong>Affected:</strong> ' +
                   f.AffectedObjects.slice(0,8).map(a=>'<code>'+esc(String(a))+'</code>').join(', ') + '</p>' : ''}
+                <button class="btn btn-sm btn-outline-info mt-1" onclick="event.stopPropagation();showFixGuide('${esc(f.RuleId||'')}')">
+                  <i class="bi bi-tools me-1"></i>Fix Guide</button>
               </div>
             </td>
           </tr>`).join('')}
@@ -525,6 +559,39 @@ async function loadDrift() {
   } catch(err) {
     container.innerHTML = `<div class="alert alert-info"><i class="bi bi-info-circle me-2"></i>
       Drift analysis requires at least 2 assessment snapshots. Run AD-Wall twice to enable comparison.</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fix Guide modal
+// ---------------------------------------------------------------------------
+async function showFixGuide(ruleId) {
+  const modal = new bootstrap.Modal(document.getElementById('fixGuideModal'));
+  document.getElementById('fixGuideModalLabel').textContent = 'Fix Guide — ' + ruleId;
+  document.getElementById('fixGuideBody').innerHTML =
+    '<div class="text-center py-4"><div class="spinner-border text-primary" role="status"></div></div>';
+  modal.show();
+  try {
+    const g = await fetchJSON('/api/fix-guide/' + encodeURIComponent(ruleId));
+    document.getElementById('fixGuideBody').innerHTML = `
+      <div class="mb-3">
+        <span class="badge badge-${(g.severity||'').toLowerCase()} me-2">${esc(g.severity||'')}</span>
+        <small class="text-muted">${esc(g.category||'')}</small>
+        ${g.mitreAttack ? `<small class="ms-2 text-muted"><i class="bi bi-link-45deg"></i>${esc(g.mitreAttack)}</small>` : ''}
+      </div>
+      <h6><i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>Why it Matters</h6>
+      <p>${esc(g.whyItMatters||'')}</p>
+      <h6><i class="bi bi-people-fill text-danger me-1"></i>Affected AD Objects (${g.affectedCount||0})</h6>
+      ${(g.affectedObjects||[]).length > 0
+        ? '<ul class="list-unstyled ps-2">' + (g.affectedObjects||[]).slice(0,20).map(a=>`<li><code>${esc(String(a))}</code></li>`).join('') + '</ul>'
+        : '<p class="text-muted small">None identified</p>'}
+      <h6><i class="bi bi-wrench-adjustable text-primary me-1"></i>Rollback-Safe Remediation Steps</h6>
+      <pre class="bg-light p-3 rounded small" style="white-space:pre-wrap">${esc(g.remediationSteps||'')}</pre>
+      <h6><i class="bi bi-terminal-fill text-success me-1"></i>Verification Command</h6>
+      <pre class="bg-dark text-success p-3 rounded small" style="white-space:pre-wrap">${esc(g.verificationCommand||'# Not available')}</pre>`;
+  } catch(err) {
+    document.getElementById('fixGuideBody').innerHTML =
+      `<div class="alert alert-warning">Could not load fix guide for ${esc(ruleId)}: ${esc(String(err))}</div>`;
   }
 }
 

@@ -591,6 +591,222 @@ function Invoke-KerberoastableCheck {
 
 #endregion
 
+
+#region Nested Privileged Group Check
+
+function Invoke-NestedPrivilegedGroupCheck {
+    <#
+    .SYNOPSIS
+        Detects Tier 0 privilege gained through nested group membership chains.
+    .DESCRIPTION
+        Recursively resolves group membership for all privileged groups to expose
+        accounts that inherit Domain Admin or Tier 0 rights via deeply nested groups
+        that would not be visible in a flat membership scan.
+        Flags non-obvious accounts (those not directly in a privileged group but
+        reachable via nesting) to surface privilege sprawl hidden inside group chains.
+    .PARAMETER Groups
+        Group objects from Get-ADGroups.
+    .PARAMETER Users
+        User objects from Get-ADUsers.
+    .EXAMPLE
+        Invoke-NestedPrivilegedGroupCheck -Groups $adGroups -Users $adUsers
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Groups,
+        [Parameter(Mandatory = $true)]
+        [object[]]$Users
+    )
+
+    Write-Verbose "Running nested privileged group check..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    $tier0Groups = @('Domain Admins','Enterprise Admins','Schema Admins','Administrators','Account Operators','Backup Operators')
+
+    # Build indexed lookups
+    $groupByDN   = @{}
+    $groupByName = @{}
+    foreach ($g in $Groups) {
+        if ($g.DistinguishedName) { $groupByDN[$g.DistinguishedName] = $g }
+        if ($g.SamAccountName)   { $groupByName[$g.SamAccountName]  = $g }
+    }
+    $userByDN = @{}
+    foreach ($u in $Users) {
+        if ($u.DistinguishedName) { $userByDN[$u.DistinguishedName] = $u }
+    }
+
+    # Recursive resolver — returns all user DNs reachable from a group DN
+    $resolveCache = @{}
+    function Resolve-GroupMembers {
+        param([string]$GroupDN, [int]$Depth = 0)
+        if ($Depth -gt 10) { return @() }
+        if ($resolveCache.ContainsKey($GroupDN)) { return $resolveCache[$GroupDN] }
+        $resolveCache[$GroupDN] = @()   # break cycles
+
+        if (-not $groupByDN.ContainsKey($GroupDN)) { return @() }
+        $grp = $groupByDN[$GroupDN]
+        $directMembers  = @($grp.Members | Where-Object { $_ })
+        $allUserDNs     = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($memberDN in $directMembers) {
+            if ($userByDN.ContainsKey($memberDN)) {
+                $allUserDNs.Add($memberDN)
+            }
+            elseif ($groupByDN.ContainsKey($memberDN)) {
+                foreach ($nestedUserDN in (Resolve-GroupMembers -GroupDN $memberDN -Depth ($Depth+1))) {
+                    $allUserDNs.Add($nestedUserDN)
+                }
+            }
+        }
+        $result = $allUserDNs.ToArray() | Sort-Object -Unique
+        $resolveCache[$GroupDN] = $result
+        return $result
+    }
+
+    foreach ($privGroupName in $tier0Groups) {
+        if (-not $groupByName.ContainsKey($privGroupName)) { continue }
+
+        $grp        = $groupByName[$privGroupName]
+        $directDNs  = @($grp.Members | Where-Object { $_ } | Where-Object { $userByDN.ContainsKey($_) })
+        $allUserDNs = Resolve-GroupMembers -GroupDN $grp.DistinguishedName
+
+        # Nested members = all - direct
+        $nestedDNs  = @($allUserDNs | Where-Object { $_ -notin $directDNs })
+
+        if ($nestedDNs.Count -gt 0) {
+            $nestedAccounts = $nestedDNs | ForEach-Object {
+                if ($userByDN.ContainsKey($_)) { $userByDN[$_].SamAccountName } else { $_ }
+            }
+            $findings.Add((New-Finding `
+                -RuleId    'IP-050' `
+                -Title     "$($nestedDNs.Count) account(s) reach '$privGroupName' via nested group chains" `
+                -Severity  'High' `
+                -Description "These accounts are NOT direct members of '$privGroupName' but inherit Tier 0 privileges through nested group membership. Nested privilege is often overlooked during access reviews, creating hidden attack paths to Domain Admin." `
+                -AffectedObjects $nestedAccounts `
+                -Remediation "Review the group nesting chain to '$privGroupName'. Remove unnecessary nested groups and flatten privilege assignment. Use tooling like BloodHound to visualise all paths." `
+                -MitreAttack 'T1078.002 - Valid Accounts: Domain Accounts'
+            ))
+        }
+    }
+
+    Write-Verbose "Nested privileged group checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region Weak Kerberos Encryption Type Check
+
+function Invoke-WeakEncryptionTypeCheck {
+    <#
+    .SYNOPSIS
+        Identifies accounts configured with only weak Kerberos encryption types.
+    .DESCRIPTION
+        Checks the msDS-SupportedEncryptionTypes attribute on user and computer
+        accounts to identify objects that support only DES or RC4 encryption.
+
+        DES (0x1, 0x2) is completely broken.
+        RC4 (0x4) is vulnerable to offline cracking (Kerberoasting/AS-REP roasting).
+        AES128 (0x8) and AES256 (0x10) should be the minimum.
+
+        Accounts with UseDESKeyOnly flag are especially dangerous.
+    .PARAMETER Users
+        User objects from Get-ADUsers.
+    .PARAMETER Computers
+        Computer objects from Get-ADComputers.
+    .EXAMPLE
+        Invoke-WeakEncryptionTypeCheck -Users $adUsers -Computers $adComputers
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Users,
+        [Parameter(Mandatory = $false)]
+        [object[]]$Computers = @()
+    )
+
+    Write-Verbose "Running weak Kerberos encryption type check..."
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    # Bit flags from msDS-SupportedEncryptionTypes
+    $DES_CRC  = 0x01
+    $DES_MD5  = 0x02
+    $RC4      = 0x04
+    $AES128   = 0x08
+    $AES256   = 0x10
+
+    # UseDESKeyOnly = UAC bit 0x200000
+    $UAC_DES_ONLY = 0x200000
+
+    # Accounts with UseDESKeyOnly set in UserAccountControl
+    $desOnlyUsers = @($Users | Where-Object {
+        $_.Enabled -and $_.UserAccountControl -band $UAC_DES_ONLY
+    })
+
+    if ($desOnlyUsers.Count -gt 0) {
+        $affected = $desOnlyUsers | Select-Object -ExpandProperty SamAccountName
+        $findings.Add((New-Finding `
+            -RuleId    'IP-060' `
+            -Title     "$($desOnlyUsers.Count) account(s) have 'Use DES encryption only' (UseDESKeyOnly)" `
+            -Severity  'Critical' `
+            -Description "The UseDESKeyOnly UAC flag forces these accounts to use only DES for Kerberos, which was broken in 2008. This allows trivial offline cracking of any captured Kerberos tickets." `
+            -AffectedObjects $affected `
+            -Remediation 'Clear the UseDESKeyOnly flag on all accounts: Set-ADUser -Identity <user> -KerberosEncryptionType AES256,AES128. DES should be globally disabled via GPO.' `
+            -MitreAttack 'T1558.003 - Steal or Forge Kerberos Tickets: Kerberoasting'
+        ))
+    }
+
+    # Accounts supporting ONLY DES/RC4 (no AES) via msDS-SupportedEncryptionTypes
+    $noAesUsers = @($Users | Where-Object {
+        $_.Enabled -and
+        $null -ne $_.SupportedEncryptionTypes -and
+        $_.SupportedEncryptionTypes -gt 0 -and
+        -not ($_.SupportedEncryptionTypes -band ($AES128 -bor $AES256))
+    })
+
+    if ($noAesUsers.Count -gt 0) {
+        $affected = $noAesUsers | Select-Object -ExpandProperty SamAccountName
+        $severity = if ($noAesUsers | Where-Object { $_.AdminCount -eq 1 }) { 'High' } else { 'Medium' }
+        $findings.Add((New-Finding `
+            -RuleId    'IP-061' `
+            -Title     "$($noAesUsers.Count) user account(s) do not support AES Kerberos encryption" `
+            -Severity  $severity `
+            -Description "These user accounts have msDS-SupportedEncryptionTypes set to only DES or RC4, with no AES support. Kerberos tickets for these accounts use weak ciphers that are easier to crack offline." `
+            -AffectedObjects $affected `
+            -Remediation 'Update msDS-SupportedEncryptionTypes to include AES256 (0x10) and AES128 (0x8). Apply GPO "Network security: Configure encryption types allowed for Kerberos" to require AES.' `
+            -MitreAttack 'T1558.003 - Steal or Forge Kerberos Tickets: Kerberoasting'
+        ))
+    }
+
+    # Computer accounts supporting only DES/RC4
+    $noAesComps = @($Computers | Where-Object {
+        $_.Enabled -and
+        $null -ne $_.SupportedEncryptionTypes -and
+        $_.SupportedEncryptionTypes -gt 0 -and
+        -not ($_.SupportedEncryptionTypes -band ($AES128 -bor $AES256))
+    })
+
+    if ($noAesComps.Count -gt 0) {
+        $affected = $noAesComps | Select-Object -ExpandProperty SamAccountName
+        $findings.Add((New-Finding `
+            -RuleId    'IP-062' `
+            -Title     "$($noAesComps.Count) computer account(s) do not support AES Kerberos encryption" `
+            -Severity  'Medium' `
+            -Description "These computer accounts lack AES Kerberos encryption support. Legacy systems forced to RC4 are vulnerable to offline hash cracking of machine account tickets." `
+            -AffectedObjects $affected `
+            -Remediation 'Upgrade OS on legacy computers where possible. Set "Network security: Configure encryption types allowed for Kerberos" GPO to AES256/AES128 only.' `
+            -MitreAttack 'T1558 - Steal or Forge Kerberos Tickets'
+        ))
+    }
+
+    Write-Verbose "Weak encryption type checks complete. Findings: $($findings.Count)"
+    return $findings.ToArray()
+}
+
+#endregion
+
 Export-ModuleMember -Function Invoke-PrivilegedGroupCheck, Invoke-PasswordPolicyCheck,
                                Invoke-StaleAccountCheck, Invoke-DelegationCheck,
-                               Invoke-KerberoastableCheck
+                               Invoke-KerberoastableCheck, Invoke-NestedPrivilegedGroupCheck,
+                               Invoke-WeakEncryptionTypeCheck

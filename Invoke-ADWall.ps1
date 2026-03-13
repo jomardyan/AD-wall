@@ -32,11 +32,11 @@
     Default $true. All operations are read-only. Set to $false only when RedTeam mode is needed.
 
 .PARAMETER Modules
-    Comma-separated list of modules to run: Identity, Config, Exploit, Persistence.
+    Comma-separated list of modules to run: Identity, Config, Exploit, Persistence, Detection.
     Defaults to all modules.
 
 .PARAMETER Format
-    Output format(s): HTML, JSON, CSV, Markdown, All. Defaults to HTML,JSON.
+    Output format(s): HTML, JSON, CSV, Markdown, CEF, Splunk, All. Defaults to HTML,JSON.
 
 .PARAMETER LaunchDashboard
     If specified, launches the Python Flask web dashboard after the assessment.
@@ -49,6 +49,30 @@
 
 .PARAMETER OrgName
     Organisation name for report headers.
+
+.PARAMETER SIEMExport
+    If specified, generates CEF and Splunk-compatible export files in addition to the standard reports.
+
+.PARAMETER JiraUrl
+    Jira base URL. When provided along with JiraProject, JiraUser, JiraToken, creates Jira issues for High+ findings.
+
+.PARAMETER JiraProject
+    Jira project key (e.g. SEC). Required when JiraUrl is specified.
+
+.PARAMETER JiraUser
+    Jira username or email. Required when JiraUrl is specified.
+
+.PARAMETER JiraToken
+    Jira API token. Required when JiraUrl is specified.
+
+.PARAMETER ServiceNowUrl
+    ServiceNow instance URL. When provided along with ServiceNowUser and ServiceNowPass, creates incidents.
+
+.PARAMETER ServiceNowUser
+    ServiceNow username. Required when ServiceNowUrl is specified.
+
+.PARAMETER ServiceNowPass
+    ServiceNow password. Required when ServiceNowUrl is specified.
 
 .EXAMPLE
     .\Invoke-ADWall.ps1 -DomainController dc01.corp.local
@@ -76,15 +100,23 @@ param(
     [string]$Mode            = 'Assessment',
     [switch]$RedTeam,
     [bool]$SafeMode          = $true,
-    [ValidateSet('Identity','Config','Exploit','Persistence')]
-    [string[]]$Modules       = @('Identity','Config','Exploit','Persistence'),
-    [ValidateSet('HTML','JSON','CSV','Markdown','All')]
+    [ValidateSet('Identity','Config','Exploit','Persistence','Detection')]
+    [string[]]$Modules       = @('Identity','Config','Exploit','Persistence','Detection'),
+    [ValidateSet('HTML','JSON','CSV','Markdown','CEF','Splunk','All')]
     [string[]]$Format        = @('HTML','JSON'),
     [switch]$LaunchDashboard,
     [string]$ConfigFile,
     [int]$StaleAccountDays   = 90,
     [string]$OrgName         = '',
-    [int]$DashboardPort      = 5000
+    [int]$DashboardPort      = 5000,
+    [switch]$SIEMExport,
+    [string]$JiraUrl,
+    [string]$JiraProject,
+    [string]$JiraUser,
+    [string]$JiraToken,
+    [string]$ServiceNowUrl,
+    [string]$ServiceNowUser,
+    [string]$ServiceNowPass
 )
 
 Set-StrictMode -Version Latest
@@ -171,9 +203,11 @@ Import-ADWallModule 'src\modules\IdentityPrivilege.ps1'
 Import-ADWallModule 'src\modules\ConfigGpo.ps1'
 Import-ADWallModule 'src\modules\ExploitVuln.ps1'
 Import-ADWallModule 'src\modules\PersistenceBackdoor.ps1'
+Import-ADWallModule 'src\modules\DetectionEngineering.ps1'
 Import-ADWallModule 'src\engine\RuleEngine.ps1'
 Import-ADWallModule 'src\engine\RiskEngine.ps1'
 Import-ADWallModule 'src\reporting\ReportGenerator.ps1'
+Import-ADWallModule 'src\reporting\WorkflowExport.ps1'
 
 #endregion
 
@@ -457,7 +491,7 @@ catch { Write-Step "Evidence store error: $_" 'WARN' }
 
 Write-Step "=== Phase 6: Generating Reports ===" 'SECTION'
 
-$reportFormats = if ($Format -contains 'All') { @('HTML','JSON','CSV','Markdown') } else { $Format }
+$reportFormats = if ($Format -contains 'All') { @('HTML','JSON','CSV','Markdown','CEF','Splunk') } else { $Format }
 $generatedFiles = @()
 
 $reportMeta = @{
@@ -477,6 +511,8 @@ foreach ($fmt in $reportFormats) {
             'JSON'     { New-JSONReport    -Findings $allFindings -PostureGrade $postureGrade -RemediationRoadmap $remediationRoad -Metadata $reportMeta  -OutputPath $OutputPath }
             'CSV'      { New-CSVReport     -Findings $allFindings -OutputPath $OutputPath }
             'Markdown' { New-MarkdownReport -Findings $allFindings -PostureGrade $postureGrade -OutputPath $OutputPath }
+            'CEF'      { New-CEFReport      -Findings $allFindings -OutputPath $OutputPath }
+            'Splunk'   { New-SplunkReport   -Findings $allFindings -OutputPath $OutputPath }
         }
         if ($file) {
             $generatedFiles += $file
@@ -484,6 +520,65 @@ foreach ($fmt in $reportFormats) {
         }
     }
     catch { Write-Step "  Failed to generate $fmt report: $_" 'WARN' }
+}
+
+# SIEM export if requested
+if ($SIEMExport -and $reportFormats -notcontains 'CEF') {
+    Write-Step "Generating SIEM export (CEF + Splunk)…" 'INFO'
+    try {
+        $cefFile    = New-CEFReport    -Findings $allFindings -OutputPath $OutputPath
+        $splunkFile = New-SplunkReport -Findings $allFindings -OutputPath $OutputPath
+        $generatedFiles += $cefFile, $splunkFile
+        Write-Step "  → CEF: $cefFile" 'OK'
+        Write-Step "  → Splunk: $splunkFile" 'OK'
+    }
+    catch { Write-Step "  SIEM export failed: $_" 'WARN' }
+}
+
+#endregion
+
+#region Workflow Integration
+
+# Jira integration
+if (-not [string]::IsNullOrEmpty($JiraUrl) -and -not [string]::IsNullOrEmpty($JiraProject)) {
+    Write-Step "=== Workflow Integration: Jira ===" 'SECTION'
+    if ([string]::IsNullOrEmpty($JiraUser) -or [string]::IsNullOrEmpty($JiraToken)) {
+        Write-Step "JiraUser and JiraToken are required for Jira integration." 'WARN'
+    }
+    else {
+        try {
+            $jiraIssues = Export-ToJira -Findings $allFindings `
+                -JiraUrl $JiraUrl -ProjectKey $JiraProject `
+                -Username $JiraUser -ApiToken $JiraToken `
+                -MinSeverity 'High'
+            Write-Step "Created $($jiraIssues.Count) Jira issue(s)" 'OK'
+            foreach ($issue in $jiraIssues) {
+                Write-Step "  → $($issue.JiraKey): $($issue.JiraUrl)" 'INFO'
+            }
+        }
+        catch { Write-Step "Jira integration failed: $_" 'WARN' }
+    }
+}
+
+# ServiceNow integration
+if (-not [string]::IsNullOrEmpty($ServiceNowUrl)) {
+    Write-Step "=== Workflow Integration: ServiceNow ===" 'SECTION'
+    if ([string]::IsNullOrEmpty($ServiceNowUser) -or [string]::IsNullOrEmpty($ServiceNowPass)) {
+        Write-Step "ServiceNowUser and ServiceNowPass are required for ServiceNow integration." 'WARN'
+    }
+    else {
+        try {
+            $snowRecords = Export-ToServiceNow -Findings $allFindings `
+                -InstanceUrl $ServiceNowUrl `
+                -Username $ServiceNowUser -Password $ServiceNowPass `
+                -MinSeverity 'High'
+            Write-Step "Created $($snowRecords.Count) ServiceNow incident(s)" 'OK'
+            foreach ($rec in $snowRecords) {
+                Write-Step "  → $($rec.Number): $($rec.RecordUrl)" 'INFO'
+            }
+        }
+        catch { Write-Step "ServiceNow integration failed: $_" 'WARN' }
+    }
 }
 
 #endregion

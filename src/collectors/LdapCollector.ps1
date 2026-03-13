@@ -218,6 +218,7 @@ function Get-ADUsers {
                 BadPwdCount             = [int](Get-LdapProperty $r 'badpwdcount')
                 HomeDirectory           = Get-LdapProperty $r 'homedirectory'
                 ScriptPath              = Get-LdapProperty $r 'scriptpath'
+                SupportedEncryptionTypes = [int](Get-LdapProperty $r 'msds-supportedencryptiontypes')
             }
             $results.Add($obj)
         }
@@ -325,7 +326,8 @@ function Get-ADComputers {
         'operatingsystemversion','operatingsystemservicepack','lastlogontimestamp',
         'whencreated','whenchanged','useraccountcontrol','serviceprincipalname',
         'msDS-AllowedToDelegateTo','msDS-AllowedToActOnBehalfOfOtherIdentity',
-        'objectsid','description','managedby','location','admincount'
+        'objectsid','description','managedby','location','admincount',
+        'msds-supportedencryptiontypes'
     )
 
     $filter   = '(objectClass=computer)'
@@ -362,6 +364,7 @@ function Get-ADComputers {
                 ManagedBy            = Get-LdapProperty $r 'managedby'
                 Location             = Get-LdapProperty $r 'location'
                 AdminCount           = [int](Get-LdapProperty $r 'admincount')
+                SupportedEncryptionTypes = [int](Get-LdapProperty $r 'msds-supportedencryptiontypes')
             })
         }
         Write-Verbose "Collected $($results.Count) computer accounts."
