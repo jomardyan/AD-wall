@@ -166,7 +166,7 @@ function Invoke-AllChecks {
     $smbSigning  = @(if ($CollectedData.ContainsKey('SmbSigning'))  { $CollectedData.SmbSigning }  else { @() })
     $ldapSigning = @(if ($CollectedData.ContainsKey('LdapSigning')) { $CollectedData.LdapSigning } else { @() })
     $smbV1       = @(if ($CollectedData.ContainsKey('SmbV1'))       { $CollectedData.SmbV1 }       else { @() })
-    $ntlm        = @(if ($CollectedData.ContainsKey('NtlmSettings'){ $CollectedData.NtlmSettings } else { @() }))
+    $ntlm        = @(if ($CollectedData.ContainsKey('NtlmSettings')) { $CollectedData.NtlmSettings } else { @() })
     $cas         = @(if ($CollectedData.ContainsKey('CertificateAuthorities'))  { $CollectedData.CertificateAuthorities }  else { @() })
     $templates   = @(if ($CollectedData.ContainsKey('CertificateTemplates'))    { $CollectedData.CertificateTemplates }    else { @() })
     $aclsEnroll  = @(if ($CollectedData.ContainsKey('EnrollmentPermissions'))   { $CollectedData.EnrollmentPermissions }   else { @() })

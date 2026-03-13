@@ -406,7 +406,7 @@ foreach ($sg in @('Critical','High','Medium','Low','Informational')) {
         'Critical' { 'Red' } 'High' { 'Yellow' } 'Medium' { 'Cyan' }
         'Low' { 'Green' } default { 'White' }
     }
-    if ($n -gt 0) { Write-Host "  $sg: $n" -ForegroundColor $col }
+    if ($n -gt 0) { Write-Host "  ${sg}: $n" -ForegroundColor $col }
 }
 
 #endregion

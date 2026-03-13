@@ -4,7 +4,7 @@
     AD-Wall Report Generator Module
 .DESCRIPTION
     Generates HTML, CSV, JSON, and Markdown assessment reports from AD-Wall findings.
-    The HTML report is self-contained with embedded CSS and Chart.js visualisations.
+    The HTML report is self-contained with embedded CSS and Chart.js visualizations.
 .NOTES
     Author: AD-Wall Project
     Version: 1.0.0
@@ -96,7 +96,7 @@ function New-HTMLReport {
     $timestamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
     $fileName    = "ADWall_Report_$timestamp.html"
     $outputFile  = Join-Path $OutputPath $fileName
-    $genDate     = Get-Date -Format 'dd MMMM yyyy HH:mm UTC'
+    $genDate     = [DateTime]::UtcNow.ToString('dd MMMM yyyy HH:mm') + ' UTC'
 
     $grade       = if ($PostureGrade) { $PostureGrade.Grade } else { 'N/A' }
     $score       = if ($PostureGrade) { $PostureGrade.Score } else { 0 }
@@ -128,7 +128,7 @@ function New-HTMLReport {
             $safeDesc     = ConvertTo-HtmlSafe $f.Description
             $safeRemed    = ConvertTo-HtmlSafe $f.Remediation
             $affectedHtml = Format-AffectedList $f.AffectedObjects
-            $mitre        = if ($f.MitreAttack) { "<a href='https://attack.mitre.org/techniques/$(($f.MitreAttack -split ' ')[0].Replace('.','/')/))' target='_blank'>$($f.MitreAttack)</a>" } else { 'N/A' }
+            $mitre        = if ($f.MitreAttack) { "<a href='https://attack.mitre.org/techniques/$(($f.MitreAttack -split ' ')[0].Replace('.','/'))' target='_blank'>$($f.MitreAttack)</a>" } else { 'N/A' }
 
             [void]$findingsHtml.AppendLine(@"
 <div class='finding-card' id='$($f.RuleId)'>

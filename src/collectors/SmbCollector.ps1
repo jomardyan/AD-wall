@@ -168,7 +168,7 @@ function Get-SMBSigningStatus {
                     -Key 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' `
                     -Value 'SMB2' -Credential $Credential
 
-                $result.SmbV2Enabled = ($smbv2Disabled -ne 0)
+                $result.SmbV2Enabled = ($null -eq $smbv2Disabled -or $smbv2Disabled -ne 0)
             }
             catch {
                 $result.Error = $_.ToString()

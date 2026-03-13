@@ -277,6 +277,7 @@ function Get-AuthenticationEvents {
         [System.Management.Automation.PSCredential]$Credential
     )
 
+    begin {
     $authEventIds = @(
         4624,  # Successful logon
         4625,  # Failed logon
@@ -292,6 +293,7 @@ function Get-AuthenticationEvents {
 
     $startTime = (Get-Date).AddDays(-$DaysBack)
     $endTime   = Get-Date
+    }
 
     process {
         foreach ($computer in $ComputerName) {
@@ -305,20 +307,19 @@ function Get-AuthenticationEvents {
                 $obj = Convert-EventToObject $_
 
                 # Enrich with logon type description
-                $obj | Add-Member -NotePropertyName 'LogonTypeDescription' -NotePropertyValue (
-                    switch ($obj.LogonType) {
-                        '2'  { 'Interactive' }
-                        '3'  { 'Network' }
-                        '4'  { 'Batch' }
-                        '5'  { 'Service' }
-                        '7'  { 'Unlock' }
-                        '8'  { 'NetworkCleartext' }
-                        '9'  { 'NewCredentials' }
-                        '10' { 'RemoteInteractive (RDP)' }
-                        '11' { 'CachedInteractive' }
-                        default { "Unknown ($($obj.LogonType))" }
-                    }
-                ) -Force
+                $logonTypeDesc = switch ($obj.LogonType) {
+                    '2'  { 'Interactive' }
+                    '3'  { 'Network' }
+                    '4'  { 'Batch' }
+                    '5'  { 'Service' }
+                    '7'  { 'Unlock' }
+                    '8'  { 'NetworkCleartext' }
+                    '9'  { 'NewCredentials' }
+                    '10' { 'RemoteInteractive (RDP)' }
+                    '11' { 'CachedInteractive' }
+                    default { "Unknown ($($obj.LogonType))" }
+                }
+                $obj | Add-Member -NotePropertyName 'LogonTypeDescription' -NotePropertyValue $logonTypeDesc -Force
 
                 # Flag Kerberoasting indicators (4769 with DES/RC4 encryption)
                 if ($obj.EventId -eq 4769) {
@@ -363,6 +364,7 @@ function Get-PrivilegedAccountEvents {
         [System.Management.Automation.PSCredential]$Credential
     )
 
+    begin {
     $privEventIds = @(
         4670,  # Permissions on an object were changed
         4672,  # Special privileges assigned to new logon
@@ -394,6 +396,7 @@ function Get-PrivilegedAccountEvents {
 
     $startTime = (Get-Date).AddDays(-$DaysBack)
     $endTime   = Get-Date
+    }
 
     process {
         foreach ($computer in $ComputerName) {
