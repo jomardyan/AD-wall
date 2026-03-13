@@ -1,22 +1,67 @@
 """
 AD-Wall Web Dashboard
-Flask application that reads JSON assessment output and serves a web UI.
+Flask application serving the AD-Wall dashboard and REST API.
+Persists all runs, findings, logs and reports to SQLite via src/core/db.py.
 """
 
-import os
-import json
 import glob
-from datetime import datetime
-from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_file, abort
 import io
 import csv
+import json
+import os
+import platform
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, render_template, jsonify, request, send_file, abort
+
+# ---------------------------------------------------------------------------
+# DB setup — adjust sys.path so we can import from src/core
+# ---------------------------------------------------------------------------
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+import core.db as db
 
 app = Flask(__name__)
 
 # Evidence store directory — override via ADWALL_DATA_DIR env var
 DATA_DIR = os.environ.get("ADWALL_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "output"))
 DATA_DIR = os.path.abspath(DATA_DIR)
+
+# Path to the PowerShell assessment script
+_REPO_ROOT  = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_SCRIPT_PATH = os.path.join(_REPO_ROOT, "Invoke-ADWall.ps1")
+
+# PowerShell executable (pwsh on Linux/Mac, powershell on Windows)
+_PWSH = "pwsh" if platform.system() != "Windows" else "powershell"
+
+
+# ---------------------------------------------------------------------------
+# Startup — configure DB & auto-import existing JSON assessments
+# ---------------------------------------------------------------------------
+
+def _startup() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    db_path = os.path.join(DATA_DIR, "adwall.db")
+    db.configure(db_path)
+    db.init_db()
+    # Auto-import any existing assessment JSON files
+    pattern = os.path.join(DATA_DIR, "ADWall_Assessment_*.json")
+    for json_file in sorted(glob.glob(pattern)):
+        try:
+            db.import_json_assessment(json_file)
+        except Exception as exc:  # pragma: no cover
+            app.logger.warning("Failed to import %s: %s", json_file, exc)
+
+
+_startup()
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +71,7 @@ DATA_DIR = os.path.abspath(DATA_DIR)
 def _list_assessment_files():
     """Return sorted list of ADWall_Assessment_*.json paths (newest first)."""
     pattern = os.path.join(DATA_DIR, "ADWall_Assessment_*.json")
-    files = sorted(glob.glob(pattern), reverse=True)
-    return files
+    return sorted(glob.glob(pattern), reverse=True)
 
 
 def _load_assessment(path: str) -> dict:
@@ -36,10 +80,61 @@ def _load_assessment(path: str) -> dict:
 
 
 def _latest_assessment() -> dict | None:
+    """
+    Return the most-recent assessment as a dict.
+    Checks SQLite first (converts the DB row + findings back to the JSON shape),
+    falls back to JSON files if SQLite has no completed runs.
+    """
+    runs = db.list_runs(limit=1)
+    completed = [r for r in runs if r.get("status") == "completed"]
+    if completed:
+        run = completed[0]
+        findings = db.get_findings_api(run["id"])
+        grade_obj = {
+            "Grade": run.get("grade", "N/A"),
+            "Score": run.get("score", 0),
+            "Description": "",
+            "CriticalCount": run.get("critical_count", 0),
+            "HighCount":     run.get("high_count", 0),
+        }
+        return {
+            "Findings":      findings,
+            "TotalFindings": run.get("total_findings", 0),
+            "PostureGrade":  grade_obj,
+            "GeneratedAt":   run.get("completed_at"),
+            "Tool":          "AD-Wall",
+            "DomainController": run.get("domain_controller"),
+            "_run_id":       run["id"],
+        }
+    # Fallback to JSON files
     files = _list_assessment_files()
     if not files:
         return None
     return _load_assessment(files[0])
+
+
+def _assessment_for_run(run_id: str) -> dict | None:
+    """Return an assessment-shaped dict for a specific run_id."""
+    run = db.get_run(run_id)
+    if not run:
+        return None
+    findings = db.get_findings_api(run_id)
+    grade_obj = {
+        "Grade": run.get("grade", "N/A"),
+        "Score": run.get("score", 0),
+        "Description": "",
+        "CriticalCount": run.get("critical_count", 0),
+        "HighCount":     run.get("high_count", 0),
+    }
+    return {
+        "Findings":      findings,
+        "TotalFindings": run.get("total_findings", 0),
+        "PostureGrade":  grade_obj,
+        "GeneratedAt":   run.get("completed_at"),
+        "Tool":          "AD-Wall",
+        "DomainController": run.get("domain_controller"),
+        "_run_id":       run_id,
+    }
 
 
 def _get_findings(assessment: dict) -> list:
@@ -64,48 +159,65 @@ def index():
 # Routes — API
 # ---------------------------------------------------------------------------
 
+@app.route("/api/info")
+def api_info():
+    """Return server-side metadata such as the PowerShell executable name."""
+    return jsonify({"pwsh": _PWSH, "platform": platform.system()})
+
 @app.route("/api/findings")
 def api_findings():
-    """Return findings from the latest assessment, with optional filters."""
-    assessment = _latest_assessment()
+    """Return findings with optional run_id, severity, category, search filters."""
+    run_id   = request.args.get("run_id")
+    severity = request.args.get("severity")
+    category = request.args.get("category")
+    search   = request.args.get("search") or ""
+
+    if run_id:
+        assessment = _assessment_for_run(run_id)
+    else:
+        assessment = _latest_assessment()
+
     if not assessment:
         return jsonify({"error": "No assessment data found", "findings": [], "total": 0}), 404
 
     findings = _get_findings(assessment)
-
-    # Query param filters
-    severity = request.args.get("severity")
-    category = request.args.get("category")
-    search   = (request.args.get("search") or "").lower()
 
     if severity:
         findings = [f for f in findings if f.get("Severity", "").lower() == severity.lower()]
     if category:
         findings = [f for f in findings if f.get("Category", "").lower() == category.lower()]
     if search:
+        sl = search.lower()
         findings = [
             f for f in findings
-            if search in f.get("Title", "").lower() or search in f.get("Description", "").lower()
+            if sl in f.get("Title", "").lower() or sl in f.get("Description", "").lower()
         ]
 
     findings = sorted(findings, key=lambda f: _severity_order(f.get("Severity", "")))
 
     return jsonify({
-        "total": len(findings),
-        "findings": findings,
+        "total":       len(findings),
+        "findings":    findings,
         "generatedAt": assessment.get("GeneratedAt"),
-        "tool": assessment.get("Tool"),
+        "tool":        assessment.get("Tool"),
+        "run_id":      assessment.get("_run_id"),
     })
 
 
 @app.route("/api/score")
 def api_score():
-    """Return the overall posture grade and score."""
-    assessment = _latest_assessment()
+    """Return the overall posture grade and score, with optional run_id filter."""
+    run_id = request.args.get("run_id")
+
+    if run_id:
+        assessment = _assessment_for_run(run_id)
+    else:
+        assessment = _latest_assessment()
+
     if not assessment:
         return jsonify({"error": "No assessment data found"}), 404
 
-    grade = assessment.get("PostureGrade") or {}
+    grade    = assessment.get("PostureGrade") or {}
     findings = _get_findings(assessment)
 
     severity_counts = {}
@@ -119,13 +231,14 @@ def api_score():
         category_counts[cat] = category_counts.get(cat, 0) + 1
 
     return jsonify({
-        "grade": grade.get("Grade", "N/A"),
-        "score": grade.get("Score", 0),
-        "description": grade.get("Description", ""),
+        "grade":          grade.get("Grade", "N/A"),
+        "score":          grade.get("Score", 0),
+        "description":    grade.get("Description", ""),
         "severityCounts": severity_counts,
         "categoryCounts": category_counts,
-        "totalFindings": len(findings),
-        "generatedAt": assessment.get("GeneratedAt"),
+        "totalFindings":  len(findings),
+        "generatedAt":    assessment.get("GeneratedAt"),
+        "run_id":         assessment.get("_run_id"),
     })
 
 
@@ -515,12 +628,303 @@ def api_compliance():
 
 
 # ---------------------------------------------------------------------------
+# Run management — PowerShell execution
+# ---------------------------------------------------------------------------
+
+def _build_ps_command(params: dict) -> list[str]:
+    """Build the PowerShell argv list from posted params."""
+    cmd = [
+        _PWSH, "-NonInteractive", "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", _SCRIPT_PATH,
+    ]
+    if params.get("domainController"):
+        cmd += ["-DomainController", params["domainController"]]
+    if params.get("mode"):
+        cmd += ["-Mode", params["mode"]]
+    if params.get("orgName"):
+        cmd += ["-OrgName", params["orgName"]]
+    if params.get("outputPath"):
+        cmd += ["-OutputPath", params["outputPath"]]
+    if params.get("staleAccountDays") is not None:
+        cmd += ["-StaleAccountDays", str(int(params["staleAccountDays"]))]
+    if params.get("configFile"):
+        cmd += ["-ConfigFile", params["configFile"]]
+    if params.get("modules"):
+        modules = params["modules"]
+        if isinstance(modules, list):
+            modules = ",".join(modules)
+        cmd += ["-Modules", modules]
+    if params.get("format"):
+        fmt = params["format"]
+        if isinstance(fmt, list):
+            fmt = ",".join(fmt)
+        cmd += ["-Format", fmt]
+    if params.get("redTeam"):
+        cmd += ["-RedTeam"]
+    if params.get("safeMode") is False:
+        cmd += ["-SafeMode", "$false"]
+    if params.get("dashboardPort"):
+        cmd += ["-DashboardPort", str(int(params["dashboardPort"]))]
+    if params.get("siemExport"):
+        cmd += ["-SIEMExport"]
+    if params.get("jiraUrl"):
+        cmd += ["-JiraUrl", params["jiraUrl"]]
+    if params.get("jiraProject"):
+        cmd += ["-JiraProject", params["jiraProject"]]
+    if params.get("jiraUser"):
+        cmd += ["-JiraUser", params["jiraUser"]]
+    if params.get("jiraToken"):
+        cmd += ["-JiraToken", params["jiraToken"]]
+    if params.get("serviceNowUrl"):
+        cmd += ["-ServiceNowUrl", params["serviceNowUrl"]]
+    if params.get("serviceNowUser"):
+        cmd += ["-ServiceNowUser", params["serviceNowUser"]]
+    if params.get("serviceNowPass"):
+        cmd += ["-ServiceNowPass", params["serviceNowPass"]]
+    if params.get("alertEmail"):
+        cmd += ["-AlertEmail", params["alertEmail"]]
+    if params.get("alertSmtpServer"):
+        cmd += ["-AlertSmtpServer", params["alertSmtpServer"]]
+    if params.get("alertSmtpPort"):
+        cmd += ["-AlertSmtpPort", str(int(params["alertSmtpPort"]))]
+    if params.get("alertOnDrift"):
+        cmd += ["-AlertOnDrift"]
+    return cmd
+
+
+_MAX_LOG_LINES_PER_RUN = 5000  # cap to prevent unbounded DB growth
+
+
+def _run_assessment_thread(run_id: str, cmd: list[str], output_path: str) -> None:
+    """Background thread: execute PowerShell, stream logs, import results."""
+    db.add_log(run_id, "Starting PowerShell assessment…", level="INFO")
+    db.add_log(run_id, "Command: " + " ".join(cmd), level="DEBUG")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        log_count = 0
+        for line in iter(proc.stdout.readline, ""):
+            line = line.rstrip("\r\n")
+            if line:
+                if log_count >= _MAX_LOG_LINES_PER_RUN:
+                    continue  # discard but keep reading so the pipe drains
+                level = "ERROR" if "error:" in line.lower() or "exception:" in line.lower() else "INFO"
+                db.add_log(run_id, line, level=level)
+                log_count += 1
+        proc.wait()
+        if proc.returncode != 0:
+            db.fail_run(run_id, f"Process exited with code {proc.returncode}")
+            return
+    except FileNotFoundError:
+        db.fail_run(run_id, f"{_PWSH} not found on this system")
+        return
+    except Exception as exc:
+        db.fail_run(run_id, str(exc))
+        return
+
+    # Import the generated JSON assessment
+    db.add_log(run_id, "Assessment complete — importing results…", level="INFO")
+    pattern = os.path.join(output_path, "ADWall_Assessment_*.json")
+    candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if candidates:
+        try:
+            new_run_id = db.import_json_assessment(candidates[0])
+            db.add_log(run_id, f"Results imported as run {new_run_id}", level="INFO")
+            # Copy grade/score from the newly imported run to this run
+            imported = db.get_run(new_run_id)
+            if imported:
+                db.complete_run(run_id, {
+                    "total_findings": imported["total_findings"],
+                    "critical_count": imported["critical_count"],
+                    "high_count":     imported["high_count"],
+                    "medium_count":   imported["medium_count"],
+                    "low_count":      imported["low_count"],
+                    "info_count":     imported["info_count"],
+                    "score":          imported["score"],
+                    "grade":          imported["grade"],
+                })
+                # Copy findings to this run too so it shows up with data
+                findings = db.get_findings(new_run_id)
+                if findings:
+                    db.save_findings(run_id, [
+                        {
+                            "RuleId": f["rule_id"], "Severity": f["severity"],
+                            "Category": f["category"], "Title": f["title"],
+                            "Description": f["description"], "Remediation": f["remediation"],
+                            "MitreAttack": f["mitre_attack"],
+                            "AffectedCount": f["affected_count"],
+                            "AffectedObjects": f.get("affected_objects"),
+                            "DetectedAt": f["detected_at"],
+                            "VerificationCommand": f["verification_command"],
+                            "CISControl": f["cis_control"], "NISTControl": f["nist_control"],
+                        }
+                        for f in findings
+                    ])
+                # Register reports under this run_id too
+                for rep in db.list_reports(new_run_id):
+                    db.register_report(run_id, rep["filename"], rep["format"], rep["file_path"])
+            else:
+                db.complete_run(run_id, {})
+        except Exception as exc:
+            db.add_log(run_id, f"Import error: {exc}", level="ERROR")
+            db.complete_run(run_id, {})
+    else:
+        db.add_log(run_id, "No assessment JSON found in output path", level="WARNING")
+        db.complete_run(run_id, {})
+
+    db.add_log(run_id, "Run finished", level="INFO")
+
+
+@app.route("/api/run/start", methods=["POST"])
+def api_run_start():
+    """
+    Start a new PowerShell assessment.
+    Body JSON fields mirror Invoke-ADWall.ps1 parameters (camelCase).
+    Pass preview_only=true to get the command without executing.
+    """
+    params = request.get_json(force=True) or {}
+    cmd    = _build_ps_command(params)
+    cmd_str = " ".join(cmd)
+
+    if params.get("preview_only"):
+        return jsonify({
+            "status":  "preview",
+            "command": cmd_str,
+            "message": "Command preview only — not executed",
+        })
+
+    # Check PowerShell availability
+    try:
+        subprocess.run([_PWSH, "-Version"], capture_output=True, timeout=5)
+        ps_available = True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        ps_available = False
+
+    run_id      = str(uuid.uuid4())[:8] + "-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    output_path = params.get("outputPath") or DATA_DIR
+
+    if not ps_available:
+        return jsonify({
+            "run_id":  run_id,
+            "status":  "preview",
+            "command": cmd_str,
+            "message": f"{_PWSH} is not available on this system. Showing command preview only.",
+        })
+
+    db.create_run(run_id, params)
+    db.add_log(run_id, "Run queued", level="INFO")
+
+    t = threading.Thread(
+        target=_run_assessment_thread,
+        args=(run_id, cmd, output_path),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({
+        "run_id":  run_id,
+        "status":  "running",
+        "command": cmd_str,
+        "message": "Assessment started",
+    }), 202
+
+
+@app.route("/api/run/<run_id>/status")
+def api_run_status(run_id: str):
+    run = db.get_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify({
+        "run_id":         run["id"],
+        "status":         run["status"],
+        "started_at":     run["started_at"],
+        "completed_at":   run["completed_at"],
+        "total_findings": run["total_findings"],
+        "grade":          run["grade"],
+        "score":          run["score"],
+    })
+
+
+@app.route("/api/run/<run_id>/logs")
+def api_run_logs(run_id: str):
+    since_id = int(request.args.get("since_id", 0))
+    logs = db.get_logs(run_id, since_id=since_id)
+    return jsonify({"run_id": run_id, "logs": logs})
+
+
+@app.route("/api/runs")
+def api_runs():
+    limit = int(request.args.get("limit", 100))
+    runs  = db.list_runs(limit=limit)
+    return jsonify({"runs": runs, "count": len(runs)})
+
+
+@app.route("/api/runs/<run_id>")
+def api_run_detail(run_id: str):
+    run = db.get_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify(run)
+
+
+@app.route("/api/runs/<run_id>/findings")
+def api_run_findings(run_id: str):
+    run = db.get_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    severity = request.args.get("severity")
+    category = request.args.get("category")
+    search   = request.args.get("search") or ""
+    findings = db.get_findings_api(run_id, severity=severity, category=category, search=search or None)
+    return jsonify({
+        "total":    len(findings),
+        "findings": findings,
+        "run_id":   run_id,
+    })
+
+
+@app.route("/api/reports")
+def api_reports():
+    run_id = request.args.get("run_id")
+    reports = db.list_reports(run_id=run_id)
+    return jsonify({"reports": reports, "count": len(reports)})
+
+
+@app.route("/api/report/<path:filename>")
+def api_report_download(filename: str):
+    """Serve a report file from DATA_DIR by filename.
+
+    Security: validate the filename against the reports table so only files
+    that AD-Wall itself registered can be served (prevents path traversal).
+    """
+    safe_name = os.path.basename(filename)
+    # Reject any path component that escapes DATA_DIR
+    if safe_name != filename.replace("\\", "/").split("/")[-1]:
+        abort(400)
+    # Validate against registered reports in the DB
+    all_reports = db.list_reports()
+    known_names = {r["filename"] for r in all_reports}
+    if safe_name not in known_names:
+        abort(404)
+    file_path = os.path.join(DATA_DIR, safe_name)
+    if not os.path.isfile(file_path):
+        abort(404)
+    return send_file(file_path, as_attachment=False)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("ADWALL_PORT", 5000))
-    os.makedirs(DATA_DIR, exist_ok=True)
     print(f"AD-Wall Dashboard starting on http://localhost:{port}")
     print(f"Reading assessment data from: {DATA_DIR}")
     app.run(host="0.0.0.0", port=port, debug=False)
