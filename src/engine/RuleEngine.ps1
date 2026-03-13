@@ -77,9 +77,30 @@ $Script:RuleCatalog = @(
     # Configuration & GPO (new)
     [PSCustomObject]@{ RuleId='CG-030'; Category='Configuration & GPO'; Name='Dangerous ACEs on Sensitive AD Objects'; Severity='Critical'; MitreAttack='T1222.001'; Enabled=$true }
     [PSCustomObject]@{ RuleId='CG-040'; Category='Configuration & GPO'; Name='Dangerous User Rights in GPO';          Severity='High';     MitreAttack='T1078.003'; Enabled=$true }
-    # Detection Engineering (new)
+    # Detection Engineering
     [PSCustomObject]@{ RuleId='DE-001'; Category='Detection Engineering'; Name='Missing Windows Audit Policies';      Severity='High';     MitreAttack='T1562.002'; Enabled=$true }
     [PSCustomObject]@{ RuleId='DE-002'; Category='Detection Engineering'; Name='Insufficient SIEM Log Coverage';      Severity='High';     MitreAttack='T1562.002'; Enabled=$true }
+    # Compliance (CIS/NIST)
+    [PSCustomObject]@{ RuleId='COMP-001'; Category='Compliance'; Name='Password Min Length < 14 (CIS 1.1.1)';          Severity='High';     MitreAttack='T1110';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-002'; Category='Compliance'; Name='Password Complexity Disabled (CIS 1.1.2)';       Severity='High';     MitreAttack='T1110';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-003'; Category='Compliance'; Name='Lockout Threshold Too High (CIS 1.1.3)';         Severity='Medium';   MitreAttack='T1110.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-004'; Category='Compliance'; Name='Password History Count < 24 (CIS 1.1.4)';        Severity='Low';      MitreAttack='T1078';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-005'; Category='Compliance'; Name='Max Password Age > 365 Days (CIS 1.1.5)';        Severity='Low';      MitreAttack='T1078';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-010'; Category='Compliance'; Name='Domain Admins > 5 Members (CIS 1.2.1)';          Severity='High';     MitreAttack='T1078.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-011'; Category='Compliance'; Name='Schema Admins Not Empty (CIS 1.2.2)';            Severity='Medium';   MitreAttack='T1078.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-012'; Category='Compliance'; Name='Guest Account Enabled (CIS 1.2.3)';              Severity='Medium';   MitreAttack='T1078.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-013'; Category='Compliance'; Name='Privileged Accounts Password Never Expires';     Severity='High';     MitreAttack='T1078';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-020'; Category='Compliance'; Name='NTLMv1 Allowed on DCs (CIS 1.3.1)';             Severity='High';     MitreAttack='T1557.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-030'; Category='Compliance'; Name='Trust Without SID Filtering (CIS 1.4.1)';        Severity='High';     MitreAttack='T1134.005'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-040'; Category='Compliance'; Name='LAPS Not Deployed (CIS 4.1)';                   Severity='High';     MitreAttack='T1550.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-041'; Category='Compliance'; Name='LAPS Coverage Below 80%';                        Severity='Medium';   MitreAttack='T1550.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-042'; Category='Compliance'; Name='LAPS Coverage Not 100%';                         Severity='Low';      MitreAttack='T1550.002'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-050'; Category='Compliance'; Name='Protected Users Group Missing';                  Severity='Medium';   MitreAttack='T1003';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-051'; Category='Compliance'; Name='Privileged Accounts Not in Protected Users';     Severity='High';     MitreAttack='T1003';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-060'; Category='Compliance'; Name='Classic Service Accounts Should Use gMSA';       Severity='Medium';   MitreAttack='T1558.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-061'; Category='Compliance'; Name='No gMSA Accounts Found';                         Severity='Informational'; MitreAttack='T1558.003'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-070'; Category='Compliance'; Name='DA Accounts With Email (Mixed-Use)';             Severity='High';     MitreAttack='T1566';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='COMP-071'; Category='Compliance'; Name='DA Accounts Without Admin Naming Convention';    Severity='Medium';   MitreAttack='T1078.002'; Enabled=$true }
 )
 
 #endregion
@@ -160,8 +181,8 @@ function Invoke-AllChecks {
         [hashtable]$CollectedData,
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet('Identity','Config','Exploit','Persistence','Detection')]
-        [string[]]$Modules = @('Identity','Config','Exploit','Persistence','Detection'),
+        [ValidateSet('Identity','Config','Exploit','Persistence','Detection','Compliance')]
+        [string[]]$Modules = @('Identity','Config','Exploit','Persistence','Detection','Compliance'),
 
         [string]$DomainName = $env:USERDNSDOMAIN
     )
@@ -288,6 +309,16 @@ function Invoke-AllChecks {
         catch { Write-Warning "Detection Engineering module error: $_" }
     }
 
+    # Compliance (CIS / NIST / MS Baseline)
+    if ('Compliance' -in $Modules) {
+        Write-Verbose "=== Running Compliance checks ==="
+        try {
+            $compFindings = Invoke-AllComplianceChecks -CollectedData $CollectedData
+            $compFindings | ForEach-Object { $allFindings.Add($_) }
+        }
+        catch { Write-Warning "Compliance module error: $_" }
+    }
+
     # Enrich with rule metadata and deduplicate
     $enriched = Invoke-FindingEnrichment -Findings $allFindings.ToArray()
     $deduped  = Invoke-FindingDeduplication -Findings $enriched
@@ -341,6 +372,23 @@ function Invoke-FindingEnrichment {
         'PB-060' = 'Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "*\Microsoft\*" -and $_.Principal.UserId -match "SYSTEM" } | Select-Object TaskName, TaskPath, @{N="RunAs";E={$_.Principal.UserId}}'
         'DE-001' = 'auditpol /get /category:"Account Logon","Logon/Logoff","DS Access","Account Management","Privilege Use","Policy Change","Detailed Tracking"'
         'DE-002' = 'Get-WinEvent -ListLog Security | Select-Object LogName, MaximumSizeInBytes, RecordCount'
+        'COMP-001' = 'Get-ADDefaultDomainPasswordPolicy | Select-Object MinPasswordLength'
+        'COMP-002' = 'Get-ADDefaultDomainPasswordPolicy | Select-Object PasswordComplexityEnabled'
+        'COMP-003' = 'Get-ADDefaultDomainPasswordPolicy | Select-Object LockoutThreshold, LockoutDuration, LockoutObservationWindow'
+        'COMP-010' = 'Get-ADGroupMember -Identity "Domain Admins" | Measure-Object | Select-Object Count'
+        'COMP-011' = 'Get-ADGroupMember -Identity "Schema Admins" | Select-Object SamAccountName, objectClass'
+        'COMP-012' = 'Get-ADUser -Identity Guest | Select-Object SamAccountName, Enabled'
+        'COMP-013' = 'Get-ADUser -Filter {PasswordNeverExpires -eq $true -and Enabled -eq $true -and AdminCount -eq 1} | Select-Object SamAccountName'
+        'COMP-020' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" | Select-Object LmCompatibilityLevel'
+        'COMP-030' = 'Get-ADTrust -Filter * | Select-Object Name, TrustAttributes, SIDFilteringForestAware, SIDFilteringQuarantined'
+        'COMP-040' = 'Get-ADComputer -Filter * -Properties ms-Mcs-AdmPwd,msLAPS-Password | Where-Object { -not $_."ms-Mcs-AdmPwd" -and -not $_."msLAPS-Password" } | Measure-Object | Select-Object Count'
+        'COMP-041' = 'Get-ADComputer -Filter * -Properties ms-Mcs-AdmPwd | Where-Object { -not $_."ms-Mcs-AdmPwd" } | Select-Object SamAccountName | Measure-Object | Select-Object Count'
+        'COMP-050' = 'Get-ADGroup -Identity "Protected Users" | Get-ADGroupMember | Select-Object SamAccountName'
+        'COMP-051' = 'Get-ADGroupMember -Identity "Domain Admins" | Where-Object { (Get-ADGroupMember -Identity "Protected Users" | Select-Object -ExpandProperty SamAccountName) -notcontains $_.SamAccountName } | Select-Object SamAccountName'
+        'COMP-060' = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null" -and Enabled -eq $true} | Select-Object SamAccountName, ServicePrincipalNames'
+        'COMP-061' = 'Get-ADServiceAccount -Filter * | Select-Object SamAccountName, objectClass'
+        'COMP-070' = 'Get-ADGroupMember -Identity "Domain Admins" | Get-ADUser -Properties EmailAddress | Where-Object {$_.EmailAddress} | Select-Object SamAccountName, EmailAddress'
+        'COMP-071' = 'Get-ADGroupMember -Identity "Domain Admins" | Get-ADUser -Properties EmailAddress | Select-Object SamAccountName, EmailAddress'
     }
 
     foreach ($finding in $Findings) {

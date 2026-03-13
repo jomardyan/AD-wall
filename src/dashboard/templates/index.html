@@ -108,6 +108,10 @@
       <i class="bi bi-eye-slash"></i><span>Persistence</span></a>
     <a href="#" data-page="detection">
       <i class="bi bi-radar"></i><span>Detection Eng.</span></a>
+    <a href="#" data-page="compliance">
+      <i class="bi bi-patch-check"></i><span>Compliance</span></a>
+    <a href="#" data-page="attackpaths">
+      <i class="bi bi-diagram-3"></i><span>Attack Paths</span></a>
     <a href="#" data-page="drift">
       <i class="bi bi-graph-up-arrow"></i><span>Drift Analysis</span></a>
   </nav>
@@ -211,6 +215,28 @@
     <div id="page-persistence" class="page-section"><div id="findingsPersistence"></div></div>
     <div id="page-detection"  class="page-section"><div id="findingsDetection"></div></div>
 
+    <!-- ====== COMPLIANCE ====== -->
+    <div id="page-compliance" class="page-section">
+      <div id="complianceSummaryCards" class="row g-3 mb-4"></div>
+      <div id="complianceContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>
+          Loading compliance data…
+        </div>
+      </div>
+    </div>
+
+    <!-- ====== ATTACK PATHS ====== -->
+    <div id="page-attackpaths" class="page-section">
+      <div id="attackPathsSummaryCards" class="row g-3 mb-4"></div>
+      <div id="attackPathsContent">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-hourglass-split fs-2 d-block mb-2"></i>
+          Loading attack paths…
+        </div>
+      </div>
+    </div>
+
     <!-- ====== DRIFT ANALYSIS ====== -->
     <div id="page-drift" class="page-section">
       <div id="driftContent">
@@ -265,17 +291,20 @@ const CATEGORY_MAP = {
   'config':      'Configuration & GPO',
   'exploits':    'Exploit & Vulnerability',
   'persistence': 'Persistence & Backdoor',
-  'detection':   'Detection Engineering'
+  'detection':   'Detection Engineering',
+  'compliance':  'Compliance'
 };
 
 const PAGE_TITLES = {
-  overview:    'Overview',
-  identity:    'Identity & Privilege',
-  config:      'Configuration & GPO',
-  exploits:    'Exploits & Vulnerabilities',
-  persistence: 'Persistence & Backdoor',
-  detection:   'Detection Engineering',
-  drift:       'Drift Analysis'
+  overview:     'Overview',
+  identity:     'Identity & Privilege',
+  config:       'Configuration & GPO',
+  exploits:     'Exploits & Vulnerabilities',
+  persistence:  'Persistence & Backdoor',
+  detection:    'Detection Engineering',
+  compliance:   'Compliance (CIS / NIST)',
+  attackpaths:  'Attack Paths',
+  drift:        'Drift Analysis'
 };
 
 // ---------------------------------------------------------------------------
@@ -290,8 +319,10 @@ document.querySelectorAll('#sidebar nav a').forEach(link => {
     document.querySelectorAll('.page-section').forEach(s => s.classList.remove('active'));
     document.getElementById('page-' + page).classList.add('active');
     document.getElementById('pageTitle').textContent = PAGE_TITLES[page] || page;
-    if (page === 'drift') loadDrift();
-    if (['identity','config','exploits','persistence','detection'].includes(page)) renderCategoryPage(page);
+    if (page === 'drift')        loadDrift();
+    if (page === 'compliance')   loadCompliance();
+    if (page === 'attackpaths')  loadAttackPaths();
+    if (['identity','config','exploits','persistence','detection','compliance'].includes(page)) renderCategoryPage(page);
   });
 });
 
@@ -578,6 +609,8 @@ async function showFixGuide(ruleId) {
         <span class="badge badge-${(g.severity||'').toLowerCase()} me-2">${esc(g.severity||'')}</span>
         <small class="text-muted">${esc(g.category||'')}</small>
         ${g.mitreAttack ? `<small class="ms-2 text-muted"><i class="bi bi-link-45deg"></i>${esc(g.mitreAttack)}</small>` : ''}
+        ${g.cisControl ? `<small class="ms-2 badge bg-info text-dark">${esc(g.cisControl)}</small>` : ''}
+        ${g.nistControl ? `<small class="ms-1 badge bg-secondary">${esc(g.nistControl)}</small>` : ''}
       </div>
       <h6><i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>Why it Matters</h6>
       <p>${esc(g.whyItMatters||'')}</p>
@@ -592,6 +625,164 @@ async function showFixGuide(ruleId) {
   } catch(err) {
     document.getElementById('fixGuideBody').innerHTML =
       `<div class="alert alert-warning">Could not load fix guide for ${esc(ruleId)}: ${esc(String(err))}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Compliance page
+// ---------------------------------------------------------------------------
+async function loadCompliance() {
+  const container = document.getElementById('complianceContent');
+  const cards     = document.getElementById('complianceSummaryCards');
+  try {
+    const d = await fetchJSON('/api/compliance');
+    const s = d.summary || {};
+
+    // Summary cards
+    const scoreColor = s.complianceScore >= 80 ? 'success' : s.complianceScore >= 60 ? 'warning' : 'danger';
+    cards.innerHTML = `
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-${scoreColor} shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-${scoreColor}">${s.complianceScore||0}%</div>
+          <div class="text-muted small">Compliance Score</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-danger shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-danger">${(s.criticalCount||0) + (s.highCount||0)}</div>
+          <div class="text-muted small">Critical / High Gaps</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-warning shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-warning">${s.mediumCount||0}</div>
+          <div class="text-muted small">Medium Gaps</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold">${s.totalFindings||0}</div>
+          <div class="text-muted small">Total Compliance Findings</div>
+        </div>
+      </div>`;
+
+    // Findings table
+    if ((d.findings||[]).length === 0) {
+      container.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill me-2"></i>No compliance gaps detected.</div>';
+      return;
+    }
+
+    const rows = (d.findings||[]).map(f => `
+      <tr>
+        <td><code class="small">${esc(f.RuleId||'')}</code></td>
+        <td><span class="badge badge-${(f.Severity||'').toLowerCase()}">${esc(f.Severity||'')}</span></td>
+        <td><small class="badge bg-info text-dark">${esc(f.CISControl||'')}</small></td>
+        <td><small class="badge bg-secondary">${esc(f.NISTControl||'')}</small></td>
+        <td>${esc(f.Title||'')}</td>
+        <td>${f.AffectedCount||0}</td>
+        <td><button class="btn btn-xs btn-outline-primary btn-sm py-0" onclick="showFixGuide('${esc(f.RuleId||'')}')">Fix Guide</button></td>
+      </tr>`).join('');
+
+    container.innerHTML = `
+      <div class="card shadow-sm">
+        <div class="card-header fw-bold"><i class="bi bi-patch-check me-2"></i>Compliance Findings</div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover mb-0">
+              <thead class="table-light">
+                <tr><th>ID</th><th>Severity</th><th>CIS</th><th>NIST</th><th>Finding</th><th>Affected</th><th></th></tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+  } catch(err) {
+    container.innerHTML = `<div class="alert alert-warning">Could not load compliance data: ${esc(String(err))}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Attack Paths page
+// ---------------------------------------------------------------------------
+async function loadAttackPaths() {
+  const container = document.getElementById('attackPathsContent');
+  const cards     = document.getElementById('attackPathsSummaryCards');
+  try {
+    const d = await fetchJSON('/api/attack-paths');
+    const s = d.summary || {};
+
+    const total    = s.totalPaths    || s.AttackPathCount    || (d.paths||[]).length;
+    const critical = s.criticalPaths || s.CriticalPathCount  || 0;
+    const high     = s.highPaths     || s.HighPathCount       || 0;
+
+    const riskColor = critical > 0 ? 'danger' : high > 0 ? 'warning' : 'success';
+
+    cards.innerHTML = `
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-${riskColor} shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-${riskColor}">${total}</div>
+          <div class="text-muted small">Attack Paths Found</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-danger shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-danger">${critical}</div>
+          <div class="text-muted small">Critical Paths</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card border-warning shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold text-warning">${high}</div>
+          <div class="text-muted small">High Risk Paths</div>
+        </div>
+      </div>
+      <div class="col-sm-6 col-md-3">
+        <div class="card shadow-sm text-center p-3">
+          <div class="fs-1 fw-bold">${s.TotalNodes||s.totalNodes||'—'}</div>
+          <div class="text-muted small">Graph Nodes</div>
+        </div>
+      </div>`;
+
+    if ((d.paths||[]).length === 0) {
+      container.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill me-2"></i>No attack paths to Domain Admin identified.</div>';
+      return;
+    }
+
+    const pathCards = (d.paths||[]).map((p, i) => {
+      const sev   = p.Risk || p.risk || p.severity || 'Medium';
+      const name  = p.PathName || p.pathName || p.EdgeTypes || `Path ${i+1}`;
+      const start = p.StartNode || p.startNode || p.ruleId || '';
+      const end   = p.EndNode   || p.endNode   || 'Domain Admin' ;
+      const mitre = p.mitre     || p.MitreAttack || '';
+      const aff   = (p.AffectedObjects||p.affectedObjects||[]).slice(0,5);
+
+      return `
+        <div class="card shadow-sm mb-3">
+          <div class="card-header d-flex align-items-center gap-2">
+            <span class="badge badge-${sev.toLowerCase()}">${esc(sev)}</span>
+            <strong>${esc(name)}</strong>
+            ${start ? `<small class="text-muted ms-auto"><i class="bi bi-person-fill me-1"></i>${esc(start)}</small>` : ''}
+            ${end   ? `<small class="text-muted ms-1">→ <i class="bi bi-shield-exclamation me-1"></i>${esc(end)}</small>` : ''}
+          </div>
+          <div class="card-body py-2">
+            ${mitre ? `<small class="text-muted"><i class="bi bi-link-45deg"></i>${esc(mitre)}</small>` : ''}
+            ${aff.length > 0 ? `<div class="mt-1">${aff.map(a=>`<code class="me-1 small">${esc(String(a))}</code>`).join('')}</div>` : ''}
+            ${p.ruleId ? `<button class="btn btn-sm btn-outline-primary mt-2 py-0" onclick="showFixGuide('${esc(p.ruleId)}')">Fix Guide</button>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+
+    container.innerHTML = `
+      <div class="alert alert-info small mb-3">
+        <i class="bi bi-info-circle me-1"></i>
+        Attack paths show exploitable chains from non-privileged accounts to Domain Admin.
+        ${d.source === 'attack-graph-engine' ? 'Computed by the AD-Wall Attack Graph Engine (BFS).' : 'Derived from current findings. Run with full LDAP collection for graph-based analysis.'}
+      </div>
+      ${pathCards}`;
+
+  } catch(err) {
+    container.innerHTML = `<div class="alert alert-warning">Could not load attack paths: ${esc(String(err))}</div>`;
   }
 }
 

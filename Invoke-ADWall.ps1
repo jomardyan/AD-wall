@@ -100,8 +100,8 @@ param(
     [string]$Mode            = 'Assessment',
     [switch]$RedTeam,
     [bool]$SafeMode          = $true,
-    [ValidateSet('Identity','Config','Exploit','Persistence','Detection')]
-    [string[]]$Modules       = @('Identity','Config','Exploit','Persistence','Detection'),
+    [ValidateSet('Identity','Config','Exploit','Persistence','Detection','Compliance')]
+    [string[]]$Modules       = @('Identity','Config','Exploit','Persistence','Detection','Compliance'),
     [ValidateSet('HTML','JSON','CSV','Markdown','CEF','Splunk','All')]
     [string[]]$Format        = @('HTML','JSON'),
     [switch]$LaunchDashboard,
@@ -116,7 +116,13 @@ param(
     [string]$JiraToken,
     [string]$ServiceNowUrl,
     [string]$ServiceNowUser,
-    [string]$ServiceNowPass
+    [string]$ServiceNowPass,
+    # Monitoring mode alerting
+    [string]$AlertEmail,
+    [string]$AlertSmtpServer,
+    [int]$AlertSmtpPort      = 587,
+    [System.Management.Automation.PSCredential]$AlertSmtpCredential,
+    [switch]$AlertOnDrift
 )
 
 Set-StrictMode -Version Latest
@@ -204,8 +210,10 @@ Import-ADWallModule 'src\modules\ConfigGpo.ps1'
 Import-ADWallModule 'src\modules\ExploitVuln.ps1'
 Import-ADWallModule 'src\modules\PersistenceBackdoor.ps1'
 Import-ADWallModule 'src\modules\DetectionEngineering.ps1'
+Import-ADWallModule 'src\modules\ComplianceCheck.ps1'
 Import-ADWallModule 'src\engine\RuleEngine.ps1'
 Import-ADWallModule 'src\engine\RiskEngine.ps1'
+Import-ADWallModule 'src\engine\AttackGraphEngine.ps1'
 Import-ADWallModule 'src\reporting\ReportGenerator.ps1'
 Import-ADWallModule 'src\reporting\WorkflowExport.ps1'
 
@@ -246,8 +254,7 @@ if (-not (Test-Path $OutputPath)) {
 #region Initialise evidence database
 
 Write-Step "Initialising evidence store…" 'INFO'
-$dbPath = if ($config.DatabasePath) { $config.DatabasePath } else { Join-Path $OutputPath 'adwall_evidence.json' }
-Initialize-ADWallDatabase -Path $dbPath
+Initialize-ADWallDatabase -OutputPath $OutputPath
 
 #endregion
 
@@ -445,6 +452,46 @@ foreach ($sg in @('Critical','High','Medium','Low','Informational')) {
 
 #endregion
 
+#region Compliance Checks
+
+if ('Compliance' -in $Modules) {
+    Write-Step "=== Phase 4b: Compliance Checks (CIS/NIST) ===" 'SECTION'
+    try {
+        $complianceFindings = Invoke-AllComplianceChecks -CollectedData $collectedData
+        $allFindings = @($allFindings) + @($complianceFindings)
+        Write-Step "Compliance checks complete. $($complianceFindings.Count) finding(s)" 'OK'
+    }
+    catch { Write-Step "Compliance checks error: $_" 'WARN' }
+}
+
+#endregion
+
+#region Attack Graph Analysis
+
+Write-Step "=== Phase 4c: Attack Graph Analysis ===" 'SECTION'
+
+$attackGraph    = $null
+$attackPaths    = @()
+$graphSummary   = $null
+
+try {
+    $attackGraph  = Build-AttackGraph -CollectedData $collectedData -DomainName $domainName
+    $attackPaths  = Find-AttackPaths  -Graph $attackGraph -MaxDepth 5 -MaxPaths 30
+    $graphSummary = Get-GraphSummary  -Graph $attackGraph -AttackPaths $attackPaths
+
+    Write-Step "Attack graph: $($graphSummary.TotalNodes) nodes, $($graphSummary.TotalEdges) edges" 'INFO'
+    Write-Step "Attack paths found: $($graphSummary.AttackPathCount) (Critical: $($graphSummary.CriticalPathCount), High: $($graphSummary.HighPathCount))" 'OK'
+
+    # Save graph summary alongside reports
+    $graphFile = Join-Path $OutputPath 'attack_graph.json'
+    @{ Graph = $graphSummary; Paths = $attackPaths } | ConvertTo-Json -Depth 10 |
+        Set-Content -Path $graphFile -Encoding UTF8
+    Write-Step "  → Attack graph saved: $graphFile" 'OK'
+}
+catch { Write-Step "Attack graph analysis error: $_" 'WARN' }
+
+#endregion
+
 #region Risk Scoring
 
 Write-Step "=== Phase 5: Risk Scoring ===" 'SECTION'
@@ -469,19 +516,15 @@ catch { Write-Step "Risk scoring error: $_" 'WARN' }
 #region Save to Evidence Store
 
 Write-Step "Saving findings to evidence store…" 'INFO'
+$runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 try {
-    foreach ($finding in $allFindings) {
-        Save-Finding -DatabasePath $dbPath -Finding $finding
+    if ($allFindings.Count -gt 0) {
+        $allFindings | Save-Finding -RunId $runId -Domain $domainName
     }
     if ($config.EnableSnapshots) {
-        $snapshotMeta = @{
-            TotalFindings = $allFindings.Count
-            Grade         = if ($postureGrade) { $postureGrade.Grade } else { 'N/A' }
-            Score         = if ($postureGrade) { $postureGrade.Score } else { 0 }
-        }
-        Save-Snapshot -DatabasePath $dbPath -Findings $allFindings -Metadata $snapshotMeta
+        Save-Snapshot -SnapshotData $collectedData -Label "scan-$runId" -Domain $domainName
     }
-    Write-Step "Evidence store updated: $dbPath" 'OK'
+    Write-Step "Evidence store updated (run: $runId)" 'OK'
 }
 catch { Write-Step "Evidence store error: $_" 'WARN' }
 
@@ -579,6 +622,83 @@ if (-not [string]::IsNullOrEmpty($ServiceNowUrl)) {
         }
         catch { Write-Step "ServiceNow integration failed: $_" 'WARN' }
     }
+}
+
+#endregion
+
+#region Monitoring Mode Alerting
+
+if ($Mode -eq 'Monitoring' -and -not [string]::IsNullOrEmpty($AlertEmail)) {
+    Write-Step "=== Monitoring: Drift Alerting ===" 'SECTION'
+
+    try {
+        # Compare current snapshot to the previous one
+        $snapshots = Get-Snapshots
+        $driftData = $null
+
+        if ($snapshots.Count -ge 2) {
+            $prev    = @($snapshots)[-2]
+            $current = @($snapshots)[-1]
+            $driftData = Compare-Snapshots -BaselineId $prev.SnapshotId -CurrentId $current.SnapshotId
+        }
+
+        # Collect findings that cross the alerting threshold
+        $critHigh = @($allFindings | Where-Object { $_.Severity -in @('Critical','High') })
+        $hasDrift = $null -ne $driftData -and (
+            $driftData.TotalAdded -gt 0 -or $driftData.TotalRemoved -gt 0 -or $driftData.TotalModified -gt 0)
+
+        $shouldAlert = ($critHigh.Count -gt 0) -or ($AlertOnDrift -and $hasDrift)
+
+        if ($shouldAlert) {
+            Write-Step "Alert threshold reached. Sending email to $AlertEmail…" 'INFO'
+            $subject = "[AD-Wall] $Mode Alert — Domain: $domainName — $(Get-Date -Format 'dd MMM yyyy HH:mm')"
+
+            $body = @"
+AD-Wall Security Alert
+======================
+Domain    : $domainName
+Mode      : $Mode
+Scan Time : $(Get-Date -Format 'dd MMM yyyy HH:mm:ss')
+Grade     : $(if ($postureGrade) { "$($postureGrade.Grade) ($($postureGrade.Score)/100)" } else { 'N/A' })
+
+Critical Findings : $(@($allFindings | Where-Object Severity -eq 'Critical').Count)
+High Findings     : $(@($allFindings | Where-Object Severity -eq 'High').Count)
+Total Findings    : $($allFindings.Count)
+
+$(if ($hasDrift) {
+"--- DRIFT DETECTED ---
+Added   : $($driftData.TotalAdded)
+Removed : $($driftData.TotalRemoved)
+Modified: $($driftData.TotalModified)
+"})
+
+Top Critical/High Findings:
+$($critHigh | Select-Object -First 10 | ForEach-Object { "  [$($_.Severity)] $($_.RuleId) — $($_.Title)" } | Out-String)
+
+Review the full report at: $OutputPath
+"@
+
+            $mailParams = @{
+                To         = $AlertEmail
+                Subject    = $subject
+                Body       = $body
+                SmtpServer = if ($AlertSmtpServer) { $AlertSmtpServer } else { 'localhost' }
+                Port       = $AlertSmtpPort
+                UseSsl     = ($AlertSmtpPort -eq 587 -or $AlertSmtpPort -eq 465)
+            }
+            if ($AlertSmtpCredential) { $mailParams.Credential = $AlertSmtpCredential }
+
+            try {
+                Send-MailMessage @mailParams
+                Write-Step "Alert email sent to $AlertEmail" 'OK'
+            }
+            catch { Write-Step "Email send failed: $_" 'WARN' }
+        }
+        else {
+            Write-Step "No alerting threshold reached for this scan." 'INFO'
+        }
+    }
+    catch { Write-Step "Monitoring alerting error: $_" 'WARN' }
 }
 
 #endregion

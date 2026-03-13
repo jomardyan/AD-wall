@@ -359,6 +359,21 @@ def api_fix_guide(rule_id: str):
         "PB-060": 'Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "*\\Microsoft\\*" -and $_.Principal.UserId -match "SYSTEM" }',
         "DE-001": 'auditpol /get /category:"Account Logon","Logon/Logoff","DS Access","Account Management","Privilege Use","Policy Change"',
         "DE-002": 'Get-WinEvent -ListLog Security | Select-Object LogName, MaximumSizeInBytes, RecordCount',
+        "COMP-001": 'Get-ADDefaultDomainPasswordPolicy | Select-Object MinPasswordLength',
+        "COMP-002": 'Get-ADDefaultDomainPasswordPolicy | Select-Object PasswordComplexityEnabled',
+        "COMP-003": 'Get-ADDefaultDomainPasswordPolicy | Select-Object LockoutThreshold, LockoutDuration, LockoutObservationWindow',
+        "COMP-010": 'Get-ADGroupMember -Identity "Domain Admins" | Measure-Object | Select-Object Count',
+        "COMP-011": 'Get-ADGroupMember -Identity "Schema Admins" | Select-Object SamAccountName, objectClass',
+        "COMP-012": 'Get-ADUser -Identity Guest | Select-Object SamAccountName, Enabled',
+        "COMP-013": 'Get-ADUser -Filter {PasswordNeverExpires -eq $true -and Enabled -eq $true -and AdminCount -eq 1} | Select-Object SamAccountName',
+        "COMP-020": 'Get-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa" -Name "LmCompatibilityLevel"',
+        "COMP-030": 'Get-ADTrust -Filter * | Select-Object Name, TrustAttributes, SIDFilteringForestAware, SIDFilteringQuarantined',
+        "COMP-040": 'Get-ADComputer -Filter * -Properties "ms-Mcs-AdmPwd" | Where-Object { -not $_."ms-Mcs-AdmPwd" } | Measure-Object | Select-Object Count',
+        "COMP-050": 'Get-ADGroup -Identity "Protected Users" | Get-ADGroupMember | Select-Object SamAccountName',
+        "COMP-051": 'Get-ADGroupMember -Identity "Domain Admins" | Select-Object SamAccountName',
+        "COMP-060": 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null" -and Enabled -eq $true} | Select-Object SamAccountName, ServicePrincipalNames',
+        "COMP-061": 'Get-ADServiceAccount -Filter * | Select-Object SamAccountName, objectClass',
+        "COMP-070": 'Get-ADGroupMember -Identity "Domain Admins" | Get-ADUser -Properties EmailAddress | Where-Object {$_.EmailAddress} | Select-Object SamAccountName, EmailAddress',
     }
 
     return jsonify({
@@ -366,6 +381,8 @@ def api_fix_guide(rule_id: str):
         "title": finding.get("Title"),
         "severity": finding.get("Severity"),
         "category": finding.get("Category"),
+        "cisControl": finding.get("CISControl", ""),
+        "nistControl": finding.get("NISTControl", ""),
         "whyItMatters": finding.get("Description"),
         "affectedObjects": finding.get("AffectedObjects", []),
         "affectedCount": finding.get("AffectedCount", 0),
@@ -375,6 +392,125 @@ def api_fix_guide(rule_id: str):
             or verification_commands.get(rule_id, f"# No verification command for {rule_id}")
         ),
         "mitreAttack": finding.get("MitreAttack"),
+    })
+
+
+@app.route("/api/attack-paths")
+def api_attack_paths():
+    """Return attack path graph data from the latest scan."""
+    graph_file = os.path.join(DATA_DIR, "attack_graph.json")
+    if not os.path.exists(graph_file):
+        # Fall back to deriving attack-path hints from findings
+        assessment = _latest_assessment()
+        if not assessment:
+            return jsonify({"error": "No assessment data found", "paths": [], "summary": {}}), 404
+
+        findings = _get_findings(assessment)
+        # Build a simplified path list from findings that indicate attack paths
+        attack_indicators = {
+            "IP-030": "Unconstrained Delegation → DC Compromise",
+            "IP-031": "Unconstrained Delegation (Computer) → TGT Capture",
+            "IP-040": "Kerberoasting → Credential Recovery",
+            "IP-041": "Privileged Kerberoasting → Instant Domain Admin",
+            "IP-017": "AS-REP Roasting → Offline Hash Crack",
+            "PB-020": "DCSync Rights → Credential Dump",
+            "EV-040": "AD CS ESC1 → Impersonate Domain Admin",
+            "EV-045": "AD CS ESC6 → Domain Compromise via Cert",
+            "CG-001": "No SMB Signing → NTLM Relay",
+            "CG-002": "No LDAP Signing → NTLM Relay → RBCD/DCSync",
+            "PB-001": "AdminSDHolder Backdoor → Persistent Privileged Access",
+            "PB-010": "SID History Injection → Privilege Escalation",
+            "PB-011": "Privileged SID History → Immediate Domain Admin",
+            "CG-020": "Trust Without SID Filtering → SID History Attack",
+            "COMP-040": "No LAPS → Pass-the-Hash Lateral Movement",
+            "COMP-051": "DA Not in Protected Users → NTLM Credential Theft",
+        }
+
+        paths = []
+        for f in findings:
+            rule_id = f.get("RuleId", "")
+            if rule_id in attack_indicators:
+                paths.append({
+                    "ruleId": rule_id,
+                    "pathName": attack_indicators[rule_id],
+                    "severity": f.get("Severity"),
+                    "affectedObjects": f.get("AffectedObjects", [])[:5],
+                    "affectedCount": f.get("AffectedCount", 0),
+                    "mitre": f.get("MitreAttack", ""),
+                })
+
+        return jsonify({
+            "paths": sorted(paths, key=lambda x: _severity_order(x.get("severity", ""))),
+            "summary": {
+                "totalPaths": len(paths),
+                "criticalPaths": sum(1 for p in paths if p["severity"] == "Critical"),
+                "highPaths": sum(1 for p in paths if p["severity"] == "High"),
+            },
+            "source": "findings-derived",
+        })
+
+    # Return precomputed graph from attack_graph.json
+    try:
+        with open(graph_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return jsonify({
+            "paths": data.get("Paths", []),
+            "summary": data.get("Graph", {}),
+            "source": "attack-graph-engine",
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc), "paths": [], "summary": {}}), 500
+
+
+@app.route("/api/compliance")
+def api_compliance():
+    """Return compliance findings grouped by CIS/NIST control."""
+    assessment = _latest_assessment()
+    if not assessment:
+        return jsonify({"error": "No assessment data found", "controls": [], "summary": {}}), 404
+
+    findings = _get_findings(assessment)
+    comp_findings = [f for f in findings if (f.get("Category") == "Compliance" or
+                                              str(f.get("RuleId", "")).startswith("COMP-"))]
+
+    # Group by CIS control family
+    by_control = {}
+    for f in comp_findings:
+        cis = f.get("CISControl") or f.get("ExtraData", {}).get("CISControl", "Uncategorized")
+        if not cis:
+            cis = "Uncategorized"
+        family = cis.split(".")[0] if "." in cis else cis
+        if family not in by_control:
+            by_control[family] = {"family": family, "findings": [], "totalCount": 0}
+        by_control[family]["findings"].append({
+            "ruleId": f.get("RuleId"),
+            "title": f.get("Title"),
+            "severity": f.get("Severity"),
+            "affectedCount": f.get("AffectedCount", 0),
+            "cisControl": f.get("CISControl", ""),
+            "nistControl": f.get("NISTControl", ""),
+            "remediation": f.get("Remediation", ""),
+        })
+        by_control[family]["totalCount"] += 1
+
+    controls = sorted(by_control.values(), key=lambda x: x["totalCount"], reverse=True)
+
+    # Compliance score (percentage of controls with no critical/high findings)
+    total_rules = len(comp_findings)
+    pass_rules  = sum(1 for f in comp_findings if f.get("Severity") not in ("Critical", "High"))
+    score = round(pass_rules / total_rules * 100, 1) if total_rules > 0 else 100.0
+
+    return jsonify({
+        "controls": controls,
+        "findings": comp_findings,
+        "summary": {
+            "totalFindings": total_rules,
+            "criticalCount": sum(1 for f in comp_findings if f.get("Severity") == "Critical"),
+            "highCount":     sum(1 for f in comp_findings if f.get("Severity") == "High"),
+            "mediumCount":   sum(1 for f in comp_findings if f.get("Severity") == "Medium"),
+            "lowCount":      sum(1 for f in comp_findings if f.get("Severity") in ("Low", "Informational")),
+            "complianceScore": score,
+        },
     })
 
 
