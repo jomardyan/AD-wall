@@ -943,7 +943,7 @@ def api_redteam():
     return jsonify({"results": findings, "total": len(findings)})
 
 
-# Static catalog of all 20 AD attack techniques
+# Static catalog of all 22 AD attack techniques
 _ATTACK_TECHNIQUES_CATALOG = [
     {"id": "T1558.003", "name": "Kerberoasting",                      "ruleId": "EV-001",  "description": "Offline cracking of service account password hashes via TGS requests.", "detectionEvents": ["4769"], "mitigations": ["Enforce AES encryption", "Use gMSA"], "severity": "Critical"},
     {"id": "T1558.004", "name": "AS-REP Roasting",                    "ruleId": "IP-017",  "description": "Request AS-REP without pre-auth for accounts with pre-auth disabled.", "detectionEvents": ["4768", "4771"], "mitigations": ["Enable Kerberos pre-authentication"], "severity": "High"},
@@ -965,12 +965,14 @@ _ATTACK_TECHNIQUES_CATALOG = [
     {"id": "T1550.002", "name": "Pass the Hash (PTH)",                "ruleId": "ATK-010", "description": "Use NTLM hash directly without cracking to authenticate laterally.", "detectionEvents": ["4624 type 3", "4776"], "mitigations": ["Deploy LAPS", "Disable NTLMv1", "Restricted Admin Mode"], "severity": "High"},
     {"id": "T1550.003", "name": "Pass the Ticket (PTT)",              "ruleId": "ATK-011", "description": "Steal and inject Kerberos tickets to authenticate as another user.", "detectionEvents": ["4769", "4624"], "mitigations": ["Remove unconstrained delegation", "Protected Users group"], "severity": "High"},
     {"id": "T1207",     "name": "DCShadow",                            "ruleId": "ATK-012", "description": "Register rogue DC to inject malicious AD changes bypassing audit.", "detectionEvents": ["5136", "nTDSDSA creation"], "mitigations": ["Deploy MDI", "Monitor Configuration NC changes"], "severity": "Critical"},
+    {"id": "T1003",     "name": "Credential Dumping (LSASS/NTDS/WDigest)", "ruleId": "ATK-015", "description": "Extract credentials from LSASS memory, NTDS.dit, or WDigest cache on DCs and workstations.", "detectionEvents": ["4688 (procdump/mimikatz)", "4656 (LSASS SACL)", "7036 (VSS)", "Sysmon EID 10"], "mitigations": ["Enable Credential Guard", "Enable LSASS PPL (RunAsPPL)", "Disable WDigest (UseLogonCredential=0)", "Deploy EDR on all DCs"], "severity": "Critical"},
+    {"id": "T1021",     "name": "Lateral Movement Path Abuse",            "ruleId": "ATK-016", "description": "Chain local admin rights, delegation, and session exposure to escalate from Tier 2 to Domain Admin via graph-based lateral paths.", "detectionEvents": ["4624 (type 3)", "4648", "4688 (psexec/wmiprvse)", "MDI lateral path alert"], "mitigations": ["Implement PAW model", "Deploy LAPS", "Enforce tiered admin", "Use BloodHound for path detection", "Protected Users group"], "severity": "Critical"},
 ]
 
 
 @app.route("/api/attack-techniques")
 def api_attack_techniques():
-    """Return the static catalog of all 20 AD attack techniques."""
+    """Return the static catalog of all 22 AD attack techniques."""
     return jsonify({"techniques": _ATTACK_TECHNIQUES_CATALOG, "total": len(_ATTACK_TECHNIQUES_CATALOG)})
 
 

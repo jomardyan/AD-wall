@@ -1289,12 +1289,160 @@ function Invoke-RedTeamDCShadow {
 
 #endregion
 
+#region CredentialDumping (T1003)
+
+function Invoke-RedTeamCredentialDumping {
+    <#
+    .SYNOPSIS
+        Red team simulation for Credential Dumping from Windows systems (T1003).
+    .DESCRIPTION
+        In safe mode returns metadata: attack path, affected DC/workstation targets,
+        MITRE ATT&CK details, detection events, and mitigations.
+        Requires -SafeMode:$false for active read-only enumeration of credential
+        protection settings (WDigest, Credential Guard readiness, LSASS PPL, legacy OS).
+        No exploitation or credential extraction is performed at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData   = @{},
+        [bool]$SafeMode      = $true
+    )
+
+    $dcs       = @(if ($ADData.ContainsKey('DomainControllers')) { $ADData.DomainControllers } else { @() })
+    $computers = @(if ($ADData.ContainsKey('Computers'))         { $ADData.Computers }         else { @() })
+    $users     = @(if ($ADData.ContainsKey('Users'))             { $ADData.Users }             else { @() })
+
+    # Active enumeration: check for Credential Guard / LSASS protection gaps
+    $targets = [System.Collections.Generic.List[string]]::new()
+    $legacyComputerCount = 0
+    if (-not $SafeMode) {
+        foreach ($dc in $dcs) {
+            if ($dc -and $dc.PSObject.Properties['DNSHostName'] -and $dc.DNSHostName) {
+                $osName = if ($dc.PSObject.Properties['OperatingSystem']) { $dc.OperatingSystem } else { 'Unknown' }
+                $targets.Add("DC: $($dc.DNSHostName) — OS: $osName")
+            }
+        }
+        $legacyComputers = @($computers | Where-Object {
+            $_ -and $_.PSObject.Properties['OperatingSystem'] -and
+            $_.OperatingSystem -match 'Windows (XP|Vista|7|2003|2008( R2)?)'
+        })
+        $legacyComputerCount = $legacyComputers.Count
+        foreach ($c in $legacyComputers) {
+            $targets.Add("Legacy OS: $($c.Name) — $($c.OperatingSystem) (WDigest cleartext risk)")
+        }
+        $privUsers = @($users | Where-Object {
+            $_ -and $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1
+        })
+        if ($privUsers.Count -gt 0) {
+            $targets.Add("$($privUsers.Count) privileged account(s) with AdminCount=1 (high-value credential targets)")
+        }
+    }
+
+    return New-RedTeamResult `
+        -AttackName      'Credential Dumping from Windows Systems' `
+        -MitreId         'T1003' `
+        -MitreName       'OS Credential Dumping' `
+        -SafeMode        $SafeMode `
+        -Targets         $(if ($targets.Count -gt 0) { $targets.ToArray() } else { @("Domain Controllers: $($dcs.Count)", "Domain-joined computers: $($computers.Count)") }) `
+        -AttackPath      "1. Gain local SYSTEM/admin on target host (DC, workstation, or server).`n2. Dump LSASS credentials via Mimikatz: sekurlsa::logonpasswords or Rubeus dump.`n3. Alternatively use ntdsutil (IFM) or VSS to copy NTDS.dit + SYSTEM hive off DCs.`n4. Extract hashes from NTDS.dit offline: Invoke-DSExtract / secretsdump.py.`n5. Crack hashes offline with hashcat or use NTLM hashes directly (PTH).`nLegacy OS targets (WDigest=ON): $legacyComputerCount" `
+        -DetectionEvents @('4688 (process creation — mimikatz/procdump)', '4656/4663 (LSASS handle access — requires SACL)', '7036 (VSS service start on DC)', 'Sysmon EID 10 (LSASS access)', 'MDI: Credential Access alert') `
+        -Mitigations     @('Enable Credential Guard on all DCs and PAWs (VBS+LSASS)', 'Enable LSASS PPL (RunAsPPL=1 in LSA registry)', 'Disable WDigest (UseLogonCredential=0 via GPO)', 'Deploy EDR with LSASS protection on all DCs', 'Restrict VSS/ntdsutil access on DCs (Tier 0 hardening)', 'Enable Windows Defender Credential Guard for hybrid scenarios') `
+        -Tools           @('Mimikatz (sekurlsa::logonpasswords, lsadump::dcsync)', 'Rubeus (dump)', 'ntdsutil IFM / vssadmin / diskshadow', 'Impacket secretsdump.py', 'CrackMapExec (--ntds)', 'DSInternals (Convert-ADManagedServiceAccountCredential)') `
+        -Commands        @(
+            '# Blue team: Verify Credential Guard status',
+            'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -ErrorAction SilentlyContinue',
+            '# Blue team: Verify LSASS PPL',
+            'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -ErrorAction SilentlyContinue',
+            '# Blue team: Verify WDigest disabled',
+            'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name "UseLogonCredential" -ErrorAction SilentlyContinue',
+            '# Blue team: Find legacy OS computers (WDigest cleartext risk)',
+            'Get-ADComputer -Filter * -Properties OperatingSystem | Where-Object { $_.OperatingSystem -match "Windows (XP|Vista|7|2003|2008( R2)?)" } | Select-Object Name, OperatingSystem'
+        )
+}
+
+#endregion
+
+#region LateralMovement (T1021 / T1550)
+
+function Invoke-RedTeamLateralMovement {
+    <#
+    .SYNOPSIS
+        Red team simulation for Lateral Movement Path Abuse (T1021 / T1550).
+    .DESCRIPTION
+        In safe mode returns metadata: attack chain, path to Tier 0, MITRE ATT&CK
+        references, detection events, and mitigations.
+        Requires -SafeMode:$false for active read-only enumeration of delegation chains,
+        AdminCount accounts, constrained delegation targets, and Tier boundary violations.
+        No exploitation is performed at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData   = @{},
+        [bool]$SafeMode      = $true
+    )
+
+    $users     = @(if ($ADData.ContainsKey('Users'))             { $ADData.Users }             else { @() })
+    $computers = @(if ($ADData.ContainsKey('Computers'))         { $ADData.Computers }         else { @() })
+    $dcs       = @(if ($ADData.ContainsKey('DomainControllers')) { $ADData.DomainControllers } else { @() })
+
+    $targets = [System.Collections.Generic.List[string]]::new()
+    if (-not $SafeMode) {
+        # Enumerate delegation chains
+        $constrained = @($users + $computers | Where-Object {
+            $_ -and $_.PSObject.Properties['msDS-AllowedToDelegateTo'] -and
+            $_.'msDS-AllowedToDelegateTo' -and $_.'msDS-AllowedToDelegateTo'.Count -gt 0
+        })
+        foreach ($obj in $constrained) {
+            $name = if ($obj.PSObject.Properties['SamAccountName']) { $obj.SamAccountName } else { $obj.Name }
+            $targets.Add("Constrained delegation: $name → $($_.'msDS-AllowedToDelegateTo' -join ', ')")
+        }
+        # AdminCount=1 non-standard accounts
+        $adminCountAccts = @($users | Where-Object {
+            $_ -and $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1
+        })
+        if ($adminCountAccts.Count -gt 0) {
+            $targets.Add("$($adminCountAccts.Count) accounts with AdminCount=1 (local admin sprawl risk)")
+        }
+        # DA accounts active recently
+        $recentDA = @($users | Where-Object {
+            $_ -and $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'CN=Domain Admins' }) -and
+            $_.PSObject.Properties['LastLogonDate'] -and $_.LastLogonDate -gt (Get-Date).AddDays(-7)
+        })
+        if ($recentDA.Count -gt 0) {
+            $targets.Add("$($recentDA.Count) DA account(s) with recent logons (credential footprint on workstations)")
+        }
+    }
+
+    return New-RedTeamResult `
+        -AttackName      'Lateral Movement Path Abuse (T0-Escalation)' `
+        -MitreId         'T1021' `
+        -MitreName       'Remote Services / Lateral Tool Transfer' `
+        -SafeMode        $SafeMode `
+        -Targets         $(if ($targets.Count -gt 0) { $targets.ToArray() } else { @("Domain: lateral movement path enumeration (requires -SafeMode:`$false)") }) `
+        -AttackPath      "1. Compromise initial foothold (low-priv domain user or local admin on workstation).`n2. Enumerate local admin rights with Invoke-ShareFinder / CrackMapExec / PowerView.`n3. Find paths to high-value targets via BloodHound (ShortestPathToDomainAdmins).`n4. Abuse local admin, WMI, WinRM, RDP, or PSExec to move laterally.`n5. Harvest credentials from LSASS on each hop (PTH or PTT).`n6. Abuse constrained/unconstrained delegation or RBCD for privilege escalation.`n7. Reach Tier 0 (DA/DC) via BFS shortest path.`nChain length depends on network segmentation and admin sprawl." `
+        -DetectionEvents @('4624 (logon type 3 — network lateral)', '4648 (explicit credential use)', '4672 (special privileges assigned)', '4688 (remote process creation — psexec/wmiprvse)', 'Sysmon EID 3 (network connection from admin tools)', 'MDI: Lateral movement path detection') `
+        -Mitigations     @('Implement PAW (Privileged Access Workstation) model for Tier 0 accounts', 'Deploy LAPS to eliminate shared local admin passwords', 'Enforce tiered administration: DA never logs on below Tier 0', 'Block SMB/WMI/WinRM laterally (segmentation / host-based firewall)', 'Use BloodHound Enterprise or PingCastle regularly for path detection', 'Enable Protected Users group for all Tier 0/1 accounts', 'Deploy Defender for Identity (lateral movement path visibility)') `
+        -Tools           @('BloodHound / SharpHound (attack path enumeration)', 'PowerView (Find-LocalAdminAccess)', 'CrackMapExec (SMB/WMI lateral)', 'Impacket (wmiexec / psexec / smbexec)', 'Rubeus (S4U2Self/S4U2Proxy — delegation abuse)', 'Cobalt Strike jump commands') `
+        -Commands        @(
+            '# Blue team: Find accounts with AdminCount=1',
+            'Get-ADUser -Filter {AdminCount -eq 1} -Properties AdminCount,MemberOf | Select-Object SamAccountName,MemberOf',
+            '# Blue team: Find constrained delegation accounts',
+            'Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo,SamAccountName | Select-Object SamAccountName,"msDS-AllowedToDelegateTo"',
+            '# Blue team: Find DA accounts with recent logons',
+            'Get-ADGroupMember "Domain Admins" -Recursive | Get-ADUser -Properties LastLogonDate | Where-Object { $_.LastLogonDate -gt (Get-Date).AddDays(-7) } | Select-Object SamAccountName,LastLogonDate',
+            '# Blue team: Find unconstrained delegation computers (lateral movement jump points)',
+            'Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation | Select-Object Name,TrustedForDelegation'
+        )
+}
+
+#endregion
+
 #region Wrapper
 
 function Invoke-AllRedTeamChecks {
     <#
     .SYNOPSIS
-        Runs all 20 red team simulation checks and returns array of results.
+        Runs all 22 red team simulation checks and returns array of results.
     .PARAMETER ADData
         Hashtable of collected AD data.
     .PARAMETER SafeMode
@@ -1329,6 +1477,8 @@ function Invoke-AllRedTeamChecks {
         { Invoke-RedTeamPassTheHash             -ADData $ADData -SafeMode $SafeMode }
         { Invoke-RedTeamPassTheTicket           -ADData $ADData -SafeMode $SafeMode }
         { Invoke-RedTeamDCShadow                -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamCredentialDumping       -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamLateralMovement         -ADData $ADData -SafeMode $SafeMode }
     )
 
     $results = [System.Collections.Generic.List[object]]::new()

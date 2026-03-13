@@ -116,6 +116,8 @@ $Script:RuleCatalog = @(
     [PSCustomObject]@{ RuleId='ATK-012'; Category='Attack Techniques'; Name='DCShadow Risk (Replication Rights Misconfiguration)'; Severity='Critical'; MitreAttack='T1207'; Enabled=$true }
     [PSCustomObject]@{ RuleId='ATK-013'; Category='Attack Techniques'; Name='NTLM Relay Surface (Multiple Vectors)';           Severity='Critical'; MitreAttack='T1557.001'; Enabled=$true }
     [PSCustomObject]@{ RuleId='ATK-014'; Category='Attack Techniques'; Name='MachineAccountQuota Abuse Path';                  Severity='Medium';   MitreAttack='T1136.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-015'; Category='Attack Techniques'; Name='Credential Dumping Surface (LSASS/NTDS/WDigest)';  Severity='Critical'; MitreAttack='T1003';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-016'; Category='Attack Techniques'; Name='Lateral Movement Path Abuse (AdminCount/Delegation)'; Severity='Critical'; MitreAttack='T1021';  Enabled=$true }
 )
 
 #endregion
@@ -431,6 +433,8 @@ function Invoke-FindingEnrichment {
         'ATK-012' = 'Get-ADObject -SearchBase "CN=Sites,CN=Configuration,$((Get-ADDomain).DistinguishedName)" -Filter {objectClass -eq "nTDSDSA"} | Select-Object DistinguishedName, Created | Sort-Object Created -Descending'
         'ATK-013' = 'Get-SmbServerConfiguration | Select-Object RequireSecuritySignature; Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LDAPServerIntegrity" -ErrorAction SilentlyContinue'
         'ATK-014' = 'Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties "ms-DS-MachineAccountQuota" | Select-Object "ms-DS-MachineAccountQuota"'
+        'ATK-015' = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -ErrorAction SilentlyContinue; Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name "UseLogonCredential" -ErrorAction SilentlyContinue'
+        'ATK-016' = 'Get-ADUser -Filter {AdminCount -eq 1} -Properties AdminCount,MemberOf | Select-Object SamAccountName,MemberOf; Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo | Select-Object Name,"msDS-AllowedToDelegateTo"'
     }
 
     foreach ($finding in $Findings) {

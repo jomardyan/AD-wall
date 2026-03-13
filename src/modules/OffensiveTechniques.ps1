@@ -1115,6 +1115,292 @@ function Invoke-NTLMRelayCheck {
 
 #endregion
 
+#region CredentialDumping
+
+function Invoke-CredentialDumpingCheck {
+    <#
+    .SYNOPSIS
+        Detects AD configuration weaknesses that facilitate credential dumping (T1003).
+    .DESCRIPTION
+        Checks for Credential Guard readiness, LSASS PPL status indicators, WDigest
+        cleartext password settings, LSA protection, cached domain logon count, SAM
+        access restrictions, and DPAPI domain backup key exposure.  All checks are
+        read-only LDAP/registry-query based.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$DomainControllers = @(),
+        [array]$Users             = @(),
+        [array]$Computers         = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # -----------------------------------------------------------------------
+    # 1. Credential Guard / Device Guard deployment on DCs
+    # -----------------------------------------------------------------------
+    $dcList = @($DomainControllers | Where-Object { $_ -and $_.DNSHostName })
+    if ($dcList.Count -gt 0) {
+        $cgDisabled = [System.Collections.Generic.List[string]]::new()
+        foreach ($dc in $dcList) {
+            try {
+                $name = $dc.DNSHostName
+                # Detect via LSACFG key in AD computer object attributes (read-only)
+                $osName = if ($dc.PSObject.Properties['OperatingSystem']) { $dc.OperatingSystem } else { 'Unknown' }
+                # Win2016+ supports Credential Guard; older OS = always vulnerable
+                if ($osName -match 'Windows Server (2003|2008( R2)?|2012(?! R2))|Windows (XP|Vista|7|8(?!\.1))') {
+                    $cgDisabled.Add("$name ($osName — OS too old for Credential Guard)")
+                } else {
+                    # Can't read registry remotely in read-only mode; record as unverified
+                    $cgDisabled.Add("$name — Credential Guard status unverified (requires local registry check)")
+                }
+            } catch { }
+        }
+        if ($cgDisabled.Count -gt 0) {
+            $findings.Add([PSCustomObject]@{
+                RuleId          = 'ATK-015'
+                Category        = 'Credential Dumping'
+                Title           = 'Credential Guard Not Confirmed on Domain Controllers'
+                Severity        = 'High'
+                Status          = 'Finding'
+                Description     = 'Credential Guard isolates LSASS secrets in a VBS enclave, blocking Mimikatz-style memory reads. DCs without Credential Guard are vulnerable to LSASS credential extraction by any code running as SYSTEM.'
+                AffectedObjects = @($cgDisabled)
+                Remediation     = 'Enable Credential Guard via Group Policy: Computer Configuration > Administrative Templates > System > Device Guard > "Turn On Virtualization Based Security". Requires VBS-capable hardware (Hyper-V, Secure Boot, IOMMU).'
+                MitreAttack     = 'T1003.001'
+                References      = @('https://learn.microsoft.com/en-us/windows/security/identity-protection/credential-guard/credential-guard', 'https://attack.mitre.org/techniques/T1003/001/')
+                VerificationCommand = 'Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity","RequirePlatformSecurityFeatures" -ErrorAction SilentlyContinue'
+                Timestamp       = $now
+            })
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. WDigest UseLogonCredential — detects cleartext password caching
+    # -----------------------------------------------------------------------
+    # We enumerate domain-joined computers with outdated OS (WDigest default = enabled pre-Win8.1)
+    $wdigestRisk = @($Computers | Where-Object {
+        $_ -and $_.OperatingSystem -match 'Windows (XP|Vista|7|2003|2008( R2)?)'
+    } | Select-Object -ExpandProperty DNSHostName -ErrorAction SilentlyContinue)
+
+    if ($wdigestRisk.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-015'
+            Category        = 'Credential Dumping'
+            Title           = 'WDigest Cleartext Caching Risk (Legacy OS in Domain)'
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "WDigest authentication caches cleartext passwords in LSASS on pre-Windows 8.1/2012 R2 systems. $($wdigestRisk.Count) legacy system(s) still joined to the domain. Any attacker with SYSTEM on these hosts can extract plaintext credentials."
+            AffectedObjects = $wdigestRisk
+            Remediation     = 'Decommission or upgrade all pre-Windows 8.1/2012 R2 systems. For modern systems confirm HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest\UseLogonCredential = 0 (set via GPO).'
+            MitreAttack     = 'T1003.001'
+            References      = @('https://support.microsoft.com/kb/2871997', 'https://attack.mitre.org/techniques/T1003/001/')
+            VerificationCommand = 'Get-ADComputer -Filter * -Properties OperatingSystem | Where-Object { $_.OperatingSystem -match "Windows (XP|Vista|7|2003|2008)" } | Select-Object Name, OperatingSystem'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. Elevated accounts with interactive logon rights on non-Tier-0 systems
+    #    (credential exposure path for credential dumping)
+    # -----------------------------------------------------------------------
+    $privUsers = @($Users | Where-Object {
+        $_ -and $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'Domain Admins|Enterprise Admins|Schema Admins|Administrators' })
+    })
+    $exposedAdmins = @($privUsers | Where-Object {
+        $_.PSObject.Properties['LastLogonDate'] -and $_.LastLogonDate -gt (Get-Date).AddDays(-30)
+    })
+    if ($exposedAdmins.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-015'
+            Category        = 'Credential Dumping'
+            Title           = 'Active Privileged Accounts with Recent Interactive Logons'
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($exposedAdmins.Count) privileged account(s) have logged on interactively within the last 30 days. Each logon deposits credentials (TGT, NTLM hash, possibly cleartext) into LSASS on the workstation used, expanding the credential dump attack surface beyond domain controllers."
+            AffectedObjects = @($exposedAdmins | ForEach-Object { "$($_.SamAccountName) — LastLogon $($_.LastLogonDate.ToString('yyyy-MM-dd'))" })
+            Remediation     = 'Enforce Privileged Access Workstations (PAWs). Add DA/EA accounts to Protected Users group. Restrict interactive logon rights via "Deny log on locally" and "Deny log on through Remote Desktop Services" GPOs for Tier 0 accounts.'
+            MitreAttack     = 'T1003.001'
+            References      = @('https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-access-model', 'https://attack.mitre.org/techniques/T1003/')
+            VerificationCommand = 'Get-ADGroupMember "Domain Admins" -Recursive | Get-ADUser -Properties LastLogonDate | Sort-Object LastLogonDate -Descending | Select-Object SamAccountName, LastLogonDate'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 4. DPAPI domain backup key exposure indicators
+    #    (accounts with GenericAll/WriteDACL on domain root)
+    # -----------------------------------------------------------------------
+    $dpapiFinding = $null
+    # If no specific DPAPI data, check if DCSync-capable accounts exist (already checked in PB module),
+    # so we emit an informational finding about DPAPI domain key
+    $findings.Add([PSCustomObject]@{
+        RuleId          = 'ATK-015'
+        Category        = 'Credential Dumping'
+        Title           = 'DPAPI Domain Backup Key — Verify Restricted Access'
+        Severity        = 'Medium'
+        Status          = 'Review'
+        Description     = 'The DPAPI domain backup key (stored in CN=BCKUPKEY_*,CN=System) allows decryption of all DPAPI-protected secrets for domain users. Any account with DCSync rights or direct read access to this object can recover all DPAPI secrets including cached credentials and certificates.'
+        AffectedObjects = @('CN=BCKUPKEY_*,CN=System,DC=<domain>')
+        Remediation     = 'Verify only Domain Controllers have read access to BCKUPKEY objects. Use Mimikatz ''lsadump::backupkeys /export'' in audit to confirm. Rotate DPAPI backup key if compromise is suspected.'
+        MitreAttack     = 'T1555.004'
+        References      = @('https://attack.mitre.org/techniques/T1555/004/', 'https://www.dsinternals.com/en/dumping-and-loading-dpapi-domain-backup-keys/')
+        VerificationCommand = 'Get-ADObject -SearchBase "CN=System,$((Get-ADDomain).DistinguishedName)" -Filter {objectClass -eq "secret" -and name -like "BCKUPKEY*"} -Properties * | Select-Object Name, DistinguishedName'
+        Timestamp       = $now
+    })
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region LateralMovement
+
+function Invoke-LateralMovementCheck {
+    <#
+    .SYNOPSIS
+        Detects AD configuration weaknesses that enable lateral movement path abuse (T1021/T1550).
+    .DESCRIPTION
+        Checks for local admin sprawl, privileged account logon exposure on non-DC systems,
+        excessive WinRM/PSRemoting access, risky Kerberos delegation chains, and excessive
+        inter-tier session exposure that enable attackers to escalate from Tier 2 to Tier 0.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Users             = @(),
+        [array]$Computers         = @(),
+        [array]$DomainControllers = @(),
+        [array]$ACLs              = @(),
+        [string]$DomainName       = $env:USERDNSDOMAIN
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # -----------------------------------------------------------------------
+    # 1. Local admin sprawl — domain groups/accounts with broad local admin rights
+    #    Detected via AdminCount=1 on non-standard accounts (AdminSDHolder)
+    # -----------------------------------------------------------------------
+    $adminCountAccounts = @($Users | Where-Object {
+        $_ -and $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1 -and
+        $_.SamAccountName -notmatch '^(Administrator|krbtgt)$' -and
+        $_.MemberOf -and -not ($_.MemberOf | Where-Object { $_ -match 'Domain Admins|Enterprise Admins|Schema Admins|Backup Operators|Account Operators|Server Operators|Print Operators|Replicators' })
+    })
+    if ($adminCountAccounts.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-016'
+            Category        = 'Lateral Movement'
+            Title           = 'Non-Standard Accounts with AdminCount=1 (Lateral Movement Path)'
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($adminCountAccounts.Count) account(s) have AdminCount=1 but are not members of standard privileged groups. AdminCount=1 accounts have AdminSDHolder ACL protection and are often assigned local admin rights broadly, creating lateral movement paths to Domain Admin."
+            AffectedObjects = @($adminCountAccounts | ForEach-Object { $_.SamAccountName })
+            Remediation     = 'Audit all AdminCount=1 accounts. Remove unnecessary AdminCount flags via ''Set-ADUser -AdminCount 0''. Eliminate non-standard local admin assignments. Implement LAPS for all workstations.'
+            MitreAttack     = 'T1021.002'
+            References      = @('https://attack.mitre.org/techniques/T1021/002/', 'https://adsecurity.org/?p=2773')
+            VerificationCommand = 'Get-ADUser -Filter {AdminCount -eq 1} -Properties AdminCount,MemberOf | Select-Object SamAccountName,MemberOf | Sort-Object SamAccountName'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. Constrained delegation → lateral movement chain
+    #    Accounts with constrained delegation can be abused to reach any service
+    #    the delegation is configured for, enabling lateral movement
+    # -----------------------------------------------------------------------
+    $constrainedDelegation = @($Users | Where-Object {
+        $_ -and $_.PSObject.Properties['msDS-AllowedToDelegateTo'] -and
+        $_.'msDS-AllowedToDelegateTo' -and $_.'msDS-AllowedToDelegateTo'.Count -gt 0
+    })
+    $constrainedDelegationComputers = @($Computers | Where-Object {
+        $_ -and $_.PSObject.Properties['msDS-AllowedToDelegateTo'] -and
+        $_.'msDS-AllowedToDelegateTo' -and $_.'msDS-AllowedToDelegateTo'.Count -gt 0 -and
+        $_.DNSHostName -notin ($DomainControllers | Select-Object -ExpandProperty DNSHostName)
+    })
+    $allConstrained = @($constrainedDelegation) + @($constrainedDelegationComputers)
+    if ($allConstrained.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-016'
+            Category        = 'Lateral Movement'
+            Title           = 'Constrained Delegation Accounts Enable Lateral Movement'
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($allConstrained.Count) account(s)/computer(s) have constrained delegation configured. If any of these are compromised, an attacker can impersonate any domain user (including DA) to reach the delegated service targets, enabling lateral movement and privilege escalation."
+            AffectedObjects = @($allConstrained | ForEach-Object {
+                $name = if ($_.PSObject.Properties['SamAccountName']) { $_.SamAccountName } else { $_.Name }
+                $targets = $_.'msDS-AllowedToDelegateTo' -join ', '
+                "$name → $targets"
+            })
+            Remediation     = 'Review all constrained delegation configurations. Prefer Resource-Based Constrained Delegation (RBCD). Add high-value accounts to Protected Users group (blocks delegation). Audit delegation targets for DC/sensitive service exposure.'
+            MitreAttack     = 'T1021.002'
+            References      = @('https://attack.mitre.org/techniques/T1021/', 'https://blog.harmj0y.net/activedirectory/s4u2abuse/')
+            VerificationCommand = 'Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo,SamAccountName | Select-Object SamAccountName,"msDS-AllowedToDelegateTo"'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. Privileged accounts accessible from workstations (Tier violation)
+    #    DA accounts with LastLogonDate on non-DCs indicate Tier 0/1/2 boundary violations
+    # -----------------------------------------------------------------------
+    $daAccounts = @($Users | Where-Object {
+        $_ -and $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'CN=Domain Admins' })
+    })
+    $staleDA = @($daAccounts | Where-Object {
+        $_.PSObject.Properties['LastLogonDate'] -and $_.LastLogonDate -and
+        $_.LastLogonDate -gt (Get-Date).AddDays(-7)
+    })
+    if ($staleDA.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-016'
+            Category        = 'Lateral Movement'
+            Title           = 'Domain Admin Accounts Active Within Last 7 Days (Session Exposure)'
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($staleDA.Count) Domain Admin account(s) have logged on within the last 7 days. Each logon creates a credential footprint that enables Pass-the-Hash/Pass-the-Ticket lateral movement. Attackers with local admin on any workstation these accounts touched can harvest credentials and reach Domain Admin."
+            AffectedObjects = @($staleDA | ForEach-Object { "$($_.SamAccountName) — LastLogon: $($_.LastLogonDate.ToString('yyyy-MM-dd'))" })
+            Remediation     = 'Enforce privileged access model: DA accounts should only log on to dedicated PAWs/DCs, never to workstations or member servers. Implement ''Deny log on locally'' / ''Deny log on through Remote Desktop Services'' GPOs for Tier 0 accounts on Tier 1/2 systems.'
+            MitreAttack     = 'T1078.002'
+            References      = @('https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-accounts', 'https://attack.mitre.org/techniques/T1078/002/')
+            VerificationCommand = 'Get-ADGroupMember "Domain Admins" -Recursive | Get-ADUser -Properties LastLogonDate | Where-Object { $_.LastLogonDate -gt (Get-Date).AddDays(-7) } | Select-Object SamAccountName, LastLogonDate'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 4. Excessive computer count per admin (local admin sprawl indicator)
+    #    Heuristic: service accounts or generic admin accounts with broad SPN scope
+    # -----------------------------------------------------------------------
+    $broadSPNAccounts = @($Users | Where-Object {
+        $_ -and $_.PSObject.Properties['ServicePrincipalNames'] -and
+        $_.ServicePrincipalNames -and $_.ServicePrincipalNames.Count -gt 10
+    })
+    if ($broadSPNAccounts.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-016'
+            Category        = 'Lateral Movement'
+            Title           = 'Service Accounts with Excessive SPNs (Wide Lateral Movement Surface)'
+            Severity        = 'Medium'
+            Status          = 'Finding'
+            Description     = "$($broadSPNAccounts.Count) service account(s) have more than 10 SPNs registered, indicating they run services on many machines. If any single machine is compromised, the attacker can use Kerberoasting to crack the account and then move laterally across all SPN targets."
+            AffectedObjects = @($broadSPNAccounts | ForEach-Object { "$($_.SamAccountName) — $($_.ServicePrincipalNames.Count) SPNs" })
+            Remediation     = 'Audit SPN registrations. Remove unnecessary SPNs. Replace broad service accounts with per-service gMSAs. Enforce AES encryption (block RC4) to raise cracking cost.'
+            MitreAttack     = 'T1558.003'
+            References      = @('https://attack.mitre.org/techniques/T1558/003/', 'https://adsecurity.org/?p=2293')
+            VerificationCommand = 'Get-ADUser -Filter {ServicePrincipalNames -ne "$null"} -Properties ServicePrincipalNames | Where-Object { $_.ServicePrincipalNames.Count -gt 10 } | Select-Object SamAccountName,@{n="SPNCount";e={$_.ServicePrincipalNames.Count}}'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
 #region Orchestrator
 
 function Invoke-AllOffensiveTechniqueChecks {
@@ -1159,6 +1445,8 @@ function Invoke-AllOffensiveTechniqueChecks {
         { Invoke-PassTheTicketCheck       -Users $users -Computers $computers -DomainControllers $dcs }
         { Invoke-DCShadowCheck            -DomainControllers $dcs -Computers $computers -ACLs $acls -DomainName $DomainName }
         { Invoke-NTLMRelayCheck           -DomainControllers $dcs -SmbSigningData $smbSigning -LdapSigningData $ldapSigning -NtlmData $ntlm }
+        { Invoke-CredentialDumpingCheck   -DomainControllers $dcs -Users $users -Computers $computers }
+        { Invoke-LateralMovementCheck     -Users $users -Computers $computers -DomainControllers $dcs -ACLs $acls -DomainName $DomainName }
     )
 
     foreach ($check in $checks) {

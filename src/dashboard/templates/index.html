@@ -1029,6 +1029,8 @@ async function loadRedTeamPage() {
         { name: 'Pass the Hash', fn: 'Invoke-RedTeamPassTheHash', mitre: 'T1550.002', risk: 'High' },
         { name: 'Pass the Ticket', fn: 'Invoke-RedTeamPassTheTicket', mitre: 'T1550.003', risk: 'High' },
         { name: 'DCShadow', fn: 'Invoke-RedTeamDCShadow', mitre: 'T1207', risk: 'Critical' },
+        { name: 'Credential Dumping (LSASS/NTDS/WDigest)', fn: 'Invoke-RedTeamCredentialDumping', mitre: 'T1003', risk: 'Critical' },
+        { name: 'Lateral Movement Path Abuse', fn: 'Invoke-RedTeamLateralMovement', mitre: 'T1021', risk: 'Critical' },
       ];
       const riskBadge = r => {
         const cls = r === 'Critical' ? 'danger' : r === 'High' ? 'warning' : 'info';
