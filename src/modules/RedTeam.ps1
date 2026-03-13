@@ -13,7 +13,7 @@
 .NOTES
     Author  : AD-Wall Project
     Version : 1.0.0
-    WARNING : Use only in authorised penetration testing engagements.
+    WARNING : Use only in authorized penetration testing engagements.
               All active-mode checks are READ-ONLY enumeration.
 #>
 
@@ -223,7 +223,7 @@ function Invoke-RedTeamPasswordSpray {
         SprayNote          = 'SIMULATION ONLY — no actual spraying performed'
         SuggestedPasswords = @(
             'Password1', 'Welcome1', 'Summer2024!', 'Winter2024!',
-            'Company1!', 'Letmein1', 'P@ssw0rd', 'Organisation1!'
+            'Company1!', 'Letmein1', 'P@ssw0rd', 'Organization1!'
         )
     })
 
@@ -294,14 +294,15 @@ function Invoke-RedTeamMachineAccountQuota {
         '# Check MachineAccountQuota (safe)',
         'Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties "ms-DS-MachineAccountQuota" | Select-Object "ms-DS-MachineAccountQuota"',
         '',
-        '# Add machine account (requires MAQ > 0, safe mode = describe only)',
-        if (-not $SafeMode -and $quota -gt 0) {
-            '# Active mode: test LDAP bind for machine account creation'
-            '# This would attempt to create a test computer account to verify MAQ exploitability'
-        }
-        else {
-            '# [SAFE MODE] Would attempt: New-ADComputer -Name "RTTestMAQ$" -SAMAccountName "RTTestMAQ$"'
-        },
+        '# Add machine account (requires MAQ > 0, safe mode = describe only)'
+    )
+    if (-not $SafeMode -and $quota -gt 0) {
+        $commands += '# Active mode: test LDAP bind for machine account creation'
+        $commands += '# This would attempt to create a test computer account to verify MAQ exploitability'
+    } else {
+        $commands += '# [SAFE MODE] Would attempt: New-ADComputer -Name "RTTestMAQ$" -SAMAccountName "RTTestMAQ$"'
+    }
+    $commands += @(
         '',
         '# PowerMad (add machine account)',
         'New-MachineAccount -MachineAccount RTTestMAQ -Password (ConvertTo-SecureString "Passw0rd123!" -AsPlainText -Force)',

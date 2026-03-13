@@ -1038,7 +1038,7 @@ async function loadRedTeamPage() {
         simTechs.map(t => {
           const hasResult = rtResults.some(r => r.title && r.title.includes(t.name));
           return `<div class="list-group-item d-flex justify-content-between align-items-center px-2 py-2">
-            <span class="small fw-semibold">${esc(t.name)} <code class="text-muted">${esc(t.mitre)}</code>${riskBadge(t.risk)}</span>
+            <span class="small fw-semibold">${esc(t.name)} <code class="text-muted">${esc(t.id)}</code>${riskBadge(t.risk)}</span>
             <button class="btn btn-sm btn-outline-danger" onclick='showSimPreview(this.dataset.json)' data-json='${esc(JSON.stringify(t))}'>
               <i class="bi bi-play-circle me-1"></i>${hasResult ? 'Results' : 'Preview'}
             </button>
@@ -1083,7 +1083,7 @@ function showSimPreview(el) {
       Active mode requires <code>-SafeMode:$false</code>.
     </div>
     <p><strong>PowerShell Function:</strong> <code>${esc(t.fn)}</code></p>
-    <p><strong>MITRE ATT&CK:</strong> <a href="https://attack.mitre.org/techniques/${esc(t.mitre.replace('.','/'))}/" target="_blank" rel="noopener">${esc(t.mitre)}</a></p>
+    <p><strong>MITRE ATT&CK:</strong> <a href="https://attack.mitre.org/techniques/${esc(t.id.replace(/\./g, '/'))}/" target="_blank" rel="noopener">${esc(t.id)}</a></p>
     <p><strong>Risk Level:</strong> <span class="badge bg-danger">${esc(t.risk)}</span></p>
     <p class="mb-0 small text-muted">Run <code>Invoke-ADWall.ps1 -RedTeam -SafeMode:$false</code> to collect full simulation results.</p>
   `;

@@ -239,7 +239,7 @@ function Invoke-GoldenTicketCheck {
             try {
                 $searcher = [System.DirectoryServices.DirectorySearcher]::new()
                 $searcher.Filter = '(sAMAccountName=krbtgt)'
-                $searcher.PropertiesToLoad.AddRange([string[]]@('pwdLastSet','whenCreated','sAMAccountName'))
+                $searcher.PropertiesToLoad.AddRange([string[]]@('pwdLastSet','whenCreated','samAccountName'))
                 $result = $searcher.FindOne()
                 if ($result) {
                     $pwdLastSetRaw = $result.Properties['pwdLastSet']
@@ -605,7 +605,7 @@ function Invoke-GoldenSAMLCheck {
                 -Severity    'Critical' `
                 -Description "Active Directory Federation Services (AD FS) is deployed in this environment. The AD FS token-signing certificate private key, if extracted (e.g., via DPAPI on the AD FS server), enables Golden SAML attacks — forging SAML tokens for any federated identity including cloud resources like Microsoft 365. This is the SAML equivalent of a Golden Ticket and was used in the SolarWinds breach (T1606.002)." `
                 -AffectedObjects $affectedObjs `
-                -Remediation '1) Store AD FS token-signing certificate private keys in HSM. 2) Restrict administrative access to AD FS servers. 3) Monitor Event ID 411 (AD FS token signing cert changes). 4) Consider migrating to Azure AD SSSO/PTA instead of AD FS federation. 5) Implement Privileged Access Workstations for AD FS management.' `
+                -Remediation '1) Store AD FS token-signing certificate private keys in HSM. 2) Restrict administrative access to AD FS servers. 3) Monitor Event ID 411 (AD FS token signing cert changes). 4) Consider migrating to Azure AD SSO/PTA instead of AD FS federation. 5) Implement Privileged Access Workstations for AD FS management.' `
                 -MitreAttack 'T1606.002'
                 -ExtraData @{ ADFSAccountsFound = $adfsAccounts.Count; ADFSConfigInAD = $adfsConfigFound }
             ))
@@ -977,7 +977,7 @@ function Invoke-DCShadowCheck {
                     -Severity    'Critical' `
                     -Description "The Configuration naming context shows $configDCCount registered domain controllers, but only $($DomainControllers.Count) DCs were enumerated. This discrepancy may indicate a rogue DC registration (DCShadow) or an orphaned DC object that needs cleanup." `
                     -AffectedObjects @("Configuration NC: $configDCCount entries vs $($DomainControllers.Count) actual DCs") `
-                    -Remediation '1) Enumerate all nTDSDSA objects in the Configuration NC. 2) Verify each corresponds to a real DC. 3) Remove orphaned DC registrations: ntdsutil "metadata cleanup". 4) Audit recent Changes to the Configuration NC.' `
+                -Remediation '1) Enumerate all nTDSDSA objects in the Configuration NC. 2) Verify each corresponds to a real DC. 3) Remove orphaned DC registrations: ntdsutil "metadata cleanup". 4) Audit recent changes to the Configuration NC.' `
                     -MitreAttack 'T1207'
                 ))
             }
