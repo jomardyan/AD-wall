@@ -714,6 +714,8 @@ def _run_assessment_thread(run_id: str, cmd: list[str], output_path: str) -> Non
             line = line.rstrip("\r\n")
             if line:
                 if log_count >= _MAX_LOG_LINES_PER_RUN:
+                    if log_count == _MAX_LOG_LINES_PER_RUN:
+                        db.add_log(run_id, f"[Log output truncated at {_MAX_LOG_LINES_PER_RUN} lines]", level="WARN")
                     continue  # discard but keep reading so the pipe drains
                 level = "ERROR" if "error:" in line.lower() or "exception:" in line.lower() else "INFO"
                 db.add_log(run_id, line, level=level)
@@ -804,10 +806,15 @@ def api_run_start():
     try:
         subprocess.run([_PWSH, "-Version"], capture_output=True, timeout=5)
         ps_available = True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError:
+        ps_available = False
+    except subprocess.TimeoutExpired:
+        # PowerShell is installed but took too long to respond — treat as unavailable
+        import logging
+        logging.warning("PowerShell version check timed out; treating as unavailable")
         ps_available = False
 
-    run_id      = str(uuid.uuid4())[:8] + "-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    run_id      = str(uuid.uuid4()) + "-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     output_path = params.get("outputPath") or DATA_DIR
 
     if not ps_available:

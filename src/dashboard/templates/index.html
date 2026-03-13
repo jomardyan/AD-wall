@@ -636,12 +636,16 @@ async function populateRunSelector() {
     data.runs.forEach(r => {
       const li = document.createElement('li');
       const short = r.id.length > 20 ? r.id.substring(0,20)+'…' : r.id;
-      li.innerHTML = `<a class="dropdown-item" href="#" onclick="selectRun('${esc(r.id)}')">
-        <i class="bi bi-layers me-2 text-muted"></i>
+      const a = document.createElement('a');
+      a.className = 'dropdown-item';
+      a.href = '#';
+      a.dataset.runId = r.id;
+      a.innerHTML = `<i class="bi bi-layers me-2 text-muted"></i>
         <span class="fw-semibold">${esc(short)}</span>
         <span class="text-muted small ms-2">${fmtDate(r.started_at)}</span>
-        ${r.grade && r.grade !== 'N/A' ? `<span class="${gradeBadgeClass(r.grade)} ms-1">${esc(r.grade)}</span>` : ''}
-      </a>`;
+        ${r.grade && r.grade !== 'N/A' ? `<span class="${gradeBadgeClass(r.grade)} ms-1">${esc(r.grade)}</span>` : ''}`;
+      a.addEventListener('click', e => { e.preventDefault(); selectRun(r.id); });
+      li.appendChild(a);
       menu.appendChild(li);
     });
   } catch(e) { /* silent */ }
@@ -1043,7 +1047,7 @@ async function loadHistory() {
     }
     tbody.innerHTML = data.runs.map(r => {
       const short = r.id.length > 22 ? r.id.substring(0,22)+'…' : r.id;
-      return `<tr style="cursor:pointer" onclick="selectRun('${esc(r.id)}'); document.querySelector('[data-page=overview]').click()">
+      return `<tr class="history-row" data-run-id="${esc(r.id)}" style="cursor:pointer">
         <td><code class="small">${esc(short)}</code></td>
         <td class="small">${fmtDate(r.started_at)}</td>
         <td>${esc(r.mode||'—')}</td>
@@ -1052,9 +1056,9 @@ async function loadHistory() {
         <td>${r.grade && r.grade !== 'N/A' ? `<span class="${gradeBadgeClass(r.grade)}">${esc(r.grade)}</span>` : '—'}</td>
         <td>${r.total_findings ?? '—'}</td>
         <td>
-          <button class="btn btn-sm btn-outline-primary me-1" onclick="event.stopPropagation();selectRun('${esc(r.id)}'); document.querySelector('[data-page=overview]').click()">
+          <button class="btn btn-sm btn-outline-primary me-1 btn-view-run" data-run-id="${esc(r.id)}">
             <i class="bi bi-bar-chart"></i> View</button>
-          <button class="btn btn-sm btn-outline-secondary" onclick="event.stopPropagation();openLogsModal('${esc(r.id)}')">
+          <button class="btn btn-sm btn-outline-secondary btn-show-logs" data-run-id="${esc(r.id)}">
             <i class="bi bi-terminal"></i> Logs</button>
         </td>
       </tr>`;
@@ -1153,6 +1157,24 @@ function refreshAll() {
       a.href = '/api/report/' + encodeURIComponent(fn);
       a.download = fn;
       a.click();
+    }
+  });
+
+  // Wire history table via event delegation (avoids onclick-in-string XSS)
+  document.getElementById('historyTableBody').addEventListener('click', e => {
+    const viewBtn  = e.target.closest('.btn-view-run');
+    const logsBtn  = e.target.closest('.btn-show-logs');
+    const row      = e.target.closest('.history-row');
+    if (viewBtn) {
+      e.stopPropagation();
+      selectRun(viewBtn.dataset.runId);
+      document.querySelector('[data-page="overview"]').click();
+    } else if (logsBtn) {
+      e.stopPropagation();
+      openLogsModal(logsBtn.dataset.runId);
+    } else if (row) {
+      selectRun(row.dataset.runId);
+      document.querySelector('[data-page="overview"]').click();
     }
   });
 

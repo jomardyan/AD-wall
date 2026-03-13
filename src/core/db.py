@@ -22,6 +22,8 @@ def configure(db_path: str) -> None:
 def _connect() -> sqlite3.Connection:
     if not _DB_PATH:
         raise RuntimeError("db.py: call configure(db_path) before using the database")
+    # check_same_thread=False is safe here because every caller opens its own
+    # connection (no shared global connection) and WAL mode enables concurrent reads.
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
