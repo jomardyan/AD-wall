@@ -443,6 +443,15 @@ function Invoke-FindingEnrichment {
             $finding | Add-Member -NotePropertyName 'RuleName'       -NotePropertyValue $rule.Name        -Force
             $finding | Add-Member -NotePropertyName 'RuleEnabled'    -NotePropertyValue $rule.Enabled     -Force
             $finding | Add-Member -NotePropertyName 'MitreReference' -NotePropertyValue $rule.MitreAttack -Force
+
+            # Overwrite Category from the rule catalog so that the canonical value is
+            # always used regardless of what the module's New-Finding call supplied.
+            # This also fixes the implicit scope bug where modules loaded earlier could
+            # have their findings categorised as 'Compliance' (the last-loaded module's
+            # default) when running under dot-source module loading.
+            if (-not [string]::IsNullOrEmpty($rule.Category)) {
+                $finding | Add-Member -NotePropertyName 'Category' -NotePropertyValue $rule.Category -Force
+            }
         }
 
         # Add verification command if available

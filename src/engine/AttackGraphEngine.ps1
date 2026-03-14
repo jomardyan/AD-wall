@@ -399,19 +399,25 @@ function Find-AttackPaths {
     while ($queue.Count -gt 0 -and $foundPaths.Count -lt $MaxPaths) {
         $current = $queue.Dequeue()
 
+        # Prune: stop exploring once we exceed the maximum allowed path depth.
         if ($current.Depth -ge $MaxDepth)    { continue }
+
+        # Prune: skip (node, depth) pairs that have already been expanded to prevent
+        # infinite loops in cyclic graphs (e.g. bidirectional group memberships).
         $visitKey = "$($current.NodeId)|$($current.Depth)"
         if (-not $visited.Add($visitKey))    { continue }
 
+        # Skip nodes with no outbound edges.
         if (-not $adj.ContainsKey($current.NodeId)) { continue }
 
         foreach ($edge in $adj[$current.NodeId]) {
             $nextId = $edge.TargetId
 
-            # Check if target is Tier 0
+            # Determine whether following this edge reaches a Tier 0 target.
             $reachedTier0 = ($nextId -in $tier0Targets) -or
                             ($Graph.Nodes.ContainsKey($nextId) -and $Graph.Nodes[$nextId].IsTier0)
 
+            # Extend the current path by one hop.
             $newPath      = @($current.Path) + @($nextId)
             $newEdgeChain = @($current.EdgeChain) + @(@{
                 SourceId = $current.NodeId
@@ -421,6 +427,8 @@ function Find-AttackPaths {
             })
 
             if ($reachedTier0) {
+                # Path reaches a Tier 0 node — record it.
+                # Risk is proportional to path length: shorter = easier = more critical.
                 $startNodeId = $newPath[0]
                 $startNode   = if ($Graph.Nodes.ContainsKey($startNodeId)) { $Graph.Nodes[$startNodeId] } else { @{ Name = $startNodeId } }
 
@@ -437,7 +445,8 @@ function Find-AttackPaths {
                 })
             }
             else {
-                # Only continue if we haven't visited this node path
+                # Enqueue the neighbour for further exploration, but only if we haven't
+                # already visited it on the current path (cycle guard at the path level).
                 if ($nextId -notin $current.Path) {
                     $queue.Enqueue(@{
                         NodeId    = $nextId
@@ -450,7 +459,9 @@ function Find-AttackPaths {
         }
     }
 
-    $result = $foundPaths.ToArray() | Sort-Object PathLength
+    # Wrap in @() to guarantee a non-null array even when no paths were found,
+    # preventing strict-mode 'Count' errors on $null return from .ToArray().
+    $result = @($foundPaths.ToArray() | Sort-Object PathLength)
     Write-Verbose "Found $($result.Count) attack paths."
     return $result
 }

@@ -13,37 +13,7 @@
 
 Set-StrictMode -Version Latest
 
-#region Helper
-
-function New-Finding {
-    param(
-        [string]$RuleId,
-        [string]$Title,
-        [ValidateSet('Critical','High','Medium','Low','Informational')]
-        [string]$Severity,
-        [string]$Category     = 'Configuration & GPO',
-        [string]$Description,
-        [object[]]$AffectedObjects,
-        [string]$Remediation,
-        [string]$MitreAttack  = '',
-        [hashtable]$ExtraData = @{}
-    )
-    return [PSCustomObject]@{
-        RuleId          = $RuleId
-        Title           = $Title
-        Severity        = $Severity
-        Category        = $Category
-        Description     = $Description
-        AffectedObjects = @($AffectedObjects | Where-Object { $_ })
-        AffectedCount   = @($AffectedObjects | Where-Object { $_ }).Count
-        Remediation     = $Remediation
-        MitreAttack     = $MitreAttack
-        ExtraData       = $ExtraData
-        DetectedAt      = (Get-Date -Format 'o')
-    }
-}
-
-#endregion
+# New-Finding is defined in src/core/FindingHelper.ps1 and dot-sourced before this module.
 
 #region Protocol Checks
 
