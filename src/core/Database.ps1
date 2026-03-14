@@ -74,10 +74,14 @@ function Initialize-ADWallDatabase {
             $Script:DbIndex = Get-Content $Script:IndexPath -Raw | ConvertFrom-Json -AsHashtable
             # ConvertFrom-Json deserialises arrays as fixed-size PowerShell arrays.
             # Always re-wrap as a generic list so that .Add() works at runtime.
+            # Using explicit if-statements for PS5.1 compatibility (the ?? operator
+            # and $(if ...) sub-expressions are not available in Windows PS 5.1).
+            if ($null -eq $Script:DbIndex.Runs)      { $Script:DbIndex.Runs      = @() }
+            if ($null -eq $Script:DbIndex.Snapshots) { $Script:DbIndex.Snapshots = @() }
             $Script:DbIndex.Runs      = [System.Collections.Generic.List[object]]::new(
-                [object[]]($Script:DbIndex.Runs      ?? @()))
+                [object[]]$Script:DbIndex.Runs)
             $Script:DbIndex.Snapshots = [System.Collections.Generic.List[object]]::new(
-                [object[]]($Script:DbIndex.Snapshots ?? @()))
+                [object[]]$Script:DbIndex.Snapshots)
         }
 
         Write-Verbose "Database initialized at: $Script:DbPath"
@@ -290,7 +294,9 @@ function Save-Snapshot {
     Ensure-Initialized
 
     try {
-        $snapshotId   = Get-Date -Format 'yyyyMMdd-HHmmss'
+        # Include milliseconds (fff) so rapid calls in tests produce distinct IDs
+        # without callers needing to sleep between snapshots.
+        $snapshotId   = Get-Date -Format 'yyyyMMdd-HHmmssfff'
         $snapshotFile = Join-Path $Script:DbPath "snapshots\$snapshotId.json"
 
         $snapshot = @{
@@ -498,8 +504,9 @@ function Compare-ObjectProperties {
         The later (current) object.
     .OUTPUTS
         Array of [PSCustomObject] records with Property, OldValue, and NewValue fields.
-        Always returns an array (empty when objects are identical) so callers can safely
-        use .Count without strict-mode null-reference errors.
+        Returns an empty array when objects are identical.  Note: PowerShell may collapse
+        the output to $null when there are zero results; callers should wrap the result
+        in @() when they need a guaranteed array (e.g. @($changes).Count).
     #>
     param($Base, $Current)
 

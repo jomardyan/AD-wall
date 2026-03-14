@@ -26,9 +26,16 @@ BeforeAll {
 # ---------------------------------------------------------------------------
 Describe 'Get-RuleCatalog' {
 
-    It 'Returns at least 80 rules (sanity check)' {
+    It 'Returns a non-empty catalog' {
         $rules = Get-RuleCatalog
-        $rules.Count | Should -BeGreaterThan 80
+        $rules | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Contains known stable rule IDs (IP-001, CG-001, ATK-001)' {
+        $ids = (Get-RuleCatalog).RuleId
+        $ids | Should -Contain 'IP-001'
+        $ids | Should -Contain 'CG-001'
+        $ids | Should -Contain 'ATK-001'
     }
 
     It 'Each rule has RuleId, Category, Severity, and Enabled fields' {

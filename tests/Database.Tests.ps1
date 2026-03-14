@@ -136,7 +136,6 @@ Describe 'Compare-Snapshots' {
         }
 
         $baseId = Save-Snapshot -SnapshotData $base -Label 'drift-base' -Domain 'corp.local'
-        Start-Sleep -Milliseconds 1100   # ensure distinct second-precision IDs
         $currId = Save-Snapshot -SnapshotData $curr -Label 'drift-curr' -Domain 'corp.local'
 
         $report = Compare-Snapshots -BaselineId $baseId -CurrentId $currId
@@ -158,7 +157,6 @@ Describe 'Compare-Snapshots' {
         }
 
         $baseId = Save-Snapshot -SnapshotData $base -Label 'rem-base' -Domain 'corp.local'
-        Start-Sleep -Milliseconds 1100
         $currId = Save-Snapshot -SnapshotData $curr -Label 'rem-curr' -Domain 'corp.local'
 
         $report = Compare-Snapshots -BaselineId $baseId -CurrentId $currId
@@ -178,7 +176,6 @@ Describe 'Compare-Snapshots' {
         }
 
         $baseId = Save-Snapshot -SnapshotData $base -Label 'mod-base' -Domain 'corp.local'
-        Start-Sleep -Milliseconds 1100
         $currId = Save-Snapshot -SnapshotData $curr -Label 'mod-curr' -Domain 'corp.local'
 
         $report = Compare-Snapshots -BaselineId $baseId -CurrentId $currId
@@ -190,7 +187,6 @@ Describe 'Compare-Snapshots' {
             Users = @([PSCustomObject]@{ DistinguishedName = 'CN=Alice,DC=corp,DC=local' })
         }
         $id1 = Save-Snapshot -SnapshotData $data -Label 'same-snap1' -Domain 'corp.local'
-        Start-Sleep -Milliseconds 1100
         $id2 = Save-Snapshot -SnapshotData $data -Label 'same-snap2' -Domain 'corp.local'
 
         $report = Compare-Snapshots -BaselineId $id1 -CurrentId $id2

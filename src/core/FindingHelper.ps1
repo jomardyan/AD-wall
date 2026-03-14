@@ -34,8 +34,10 @@ function New-Finding {
         in AD-Wall calls this function instead of building the object inline so that
         the schema remains consistent.
 
-        Mandatory fields: RuleId, Title, Severity, Description, AffectedObjects,
-        Remediation.  All other parameters are optional and default to empty values.
+        Mandatory fields: RuleId, Title, Severity, Description, Remediation.
+        AffectedObjects is optional and defaults to an empty array — pass an explicit
+        list when the finding relates to specific AD objects.  All other parameters are
+        optional and default to empty values.
     .PARAMETER RuleId
         Unique rule identifier (e.g. 'IP-001', 'CG-001', 'ATK-003').
     .PARAMETER Title
