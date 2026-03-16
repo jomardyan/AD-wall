@@ -118,6 +118,12 @@ $Script:RuleCatalog = @(
     [PSCustomObject]@{ RuleId='ATK-014'; Category='Attack Techniques'; Name='MachineAccountQuota Abuse Path';                  Severity='Medium';   MitreAttack='T1136.001'; Enabled=$true }
     [PSCustomObject]@{ RuleId='ATK-015'; Category='Attack Techniques'; Name='Credential Dumping Surface (LSASS/NTDS/WDigest)';  Severity='Critical'; MitreAttack='T1003';     Enabled=$true }
     [PSCustomObject]@{ RuleId='ATK-016'; Category='Attack Techniques'; Name='Lateral Movement Path Abuse (AdminCount/Delegation)'; Severity='Critical'; MitreAttack='T1021';  Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-017'; Category='Attack Techniques'; Name='Shadow Credentials (Key Credential Link Abuse)';      Severity='Critical'; MitreAttack='T1556';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-018'; Category='Attack Techniques'; Name='ACL Object Control Chaining';                         Severity='Critical'; MitreAttack='T1222.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-019'; Category='Attack Techniques'; Name='AdminSDHolder / SDProp Persistence';                  Severity='Critical'; MitreAttack='T1098';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-020'; Category='Attack Techniques'; Name='GPO Object Write Abuse';                              Severity='Critical'; MitreAttack='T1484.001'; Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-021'; Category='Attack Techniques'; Name='Cross-Forest / Domain Trust Exploitation';            Severity='Critical'; MitreAttack='T1199';     Enabled=$true }
+    [PSCustomObject]@{ RuleId='ATK-022'; Category='Attack Techniques'; Name='RBCD (Resource-Based Constrained Delegation) Abuse';  Severity='High';     MitreAttack='T1134.001'; Enabled=$true }
 )
 
 #endregion

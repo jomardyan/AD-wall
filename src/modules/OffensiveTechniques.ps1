@@ -30,6 +30,12 @@
       ATK-011  Pass-the-Ticket Surface
       ATK-012  DCShadow Risk
       ATK-013  NTLM Relay Surface
+      ATK-017  Shadow Credentials (Key Credential Link Abuse)
+      ATK-018  ACL Object Control Chaining
+      ATK-019  AdminSDHolder / SDProp Persistence
+      ATK-020  GPO Object Write Abuse
+      ATK-021  Cross-Forest / Domain Trust Exploitation
+      ATK-022  RBCD (Resource-Based Constrained Delegation) Abuse
 
 .NOTES
     Author  : AD-Wall Project
@@ -1373,6 +1379,852 @@ function Invoke-LateralMovementCheck {
 
 #endregion
 
+#region ShadowCredentials
+
+function Invoke-ShadowCredentialsCheck {
+    <#
+    .SYNOPSIS
+        Detects conditions enabling Shadow Credentials attacks via msDS-KeyCredentialLink (T1556).
+    .DESCRIPTION
+        Shadow Credentials abuse allows an attacker with WriteProperty rights over a target account
+        to set the msDS-KeyCredentialLink attribute with a forged key credential, then perform
+        PKINIT certificate-based authentication as that account — obtaining a TGT and NTLM hash
+        without knowing the account password. This check:
+          1. Identifies accounts with non-empty msDS-KeyCredentialLink (unexpected key entries)
+          2. Identifies accounts (non-DCs/non-WHfB) where the attribute is set outside of expected WHfB flows
+          3. Reports accounts where WriteProperty on msDS-KeyCredentialLink is overly permissive
+    .PARAMETER Users
+        User objects from LDAP collector.
+    .PARAMETER Computers
+        Computer objects from LDAP collector.
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Users     = @(),
+        [array]$Computers = @(),
+        [array]$ACLs      = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # -----------------------------------------------------------------------
+    # 1. Accounts with msDS-KeyCredentialLink set (unexpected key credentials)
+    #    In most environments, only Windows Hello for Business (WHfB) sets this.
+    #    Finding it on non-WHfB accounts (especially privileged ones) is suspicious.
+    # -----------------------------------------------------------------------
+    $usersWithKeyCredLink = @($Users | Where-Object {
+        $_ -and $_.PSObject.Properties['msDS-KeyCredentialLink'] -and
+        $_.'msDS-KeyCredentialLink' -and $_.'msDS-KeyCredentialLink'.Count -gt 0
+    })
+
+    $computersWithKeyCredLink = @($Computers | Where-Object {
+        $_ -and $_.PSObject.Properties['msDS-KeyCredentialLink'] -and
+        $_.'msDS-KeyCredentialLink' -and $_.'msDS-KeyCredentialLink'.Count -gt 0
+    })
+
+    if ($usersWithKeyCredLink.Count -gt 0) {
+        $privilegedWithKey = @($usersWithKeyCredLink | Where-Object {
+            $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'Domain Admins|Enterprise Admins|Schema Admins|Administrators' })
+        })
+
+        $severity = if ($privilegedWithKey.Count -gt 0) { 'Critical' } else { 'High' }
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-017'
+            Category        = 'Shadow Credentials'
+            Title           = "Shadow Credentials: $($usersWithKeyCredLink.Count) user account(s) have msDS-KeyCredentialLink set"
+            Severity        = $severity
+            Status          = 'Finding'
+            Description     = "The msDS-KeyCredentialLink attribute enables PKINIT certificate-based authentication. $($usersWithKeyCredLink.Count) user account(s) have this attribute set. In environments without Windows Hello for Business (WHfB), this attribute should be empty. An attacker with WriteProperty on an account can forge a key credential to authenticate as that account and retrieve its NTLM hash without knowing the password. $($privilegedWithKey.Count) privileged account(s) are affected."
+            AffectedObjects = @($usersWithKeyCredLink | ForEach-Object {
+                $isPriv = if ($_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'Domain Admins|Enterprise Admins|Schema Admins' })) { ' [PRIVILEGED]' } else { '' }
+                "$($_.SamAccountName)$isPriv"
+            })
+            Remediation     = '1) Audit msDS-KeyCredentialLink values: Get-ADUser -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object SamAccountName. 2) Remove unexpected key credentials from accounts not enrolled in WHfB. 3) Restrict WriteProperty on msDS-KeyCredentialLink to Domain Controllers only. 4) Monitor Event ID 4662 (Object access) and 5136 (DS object modification) for changes to msDS-KeyCredentialLink.'
+            MitreAttack     = 'T1556'
+            References      = @('https://attack.mitre.org/techniques/T1556/', 'https://posts.specterops.io/shadow-credentials-abusing-key-trust-account-mapping-for-takeover-8ee1a53566ab', 'https://github.com/eladshamir/Whisker')
+            VerificationCommand = 'Get-ADUser -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object SamAccountName, @{n="KeyCredCount";e={$_."msDS-KeyCredentialLink".Count}}'
+            Timestamp       = $now
+        })
+    }
+
+    if ($computersWithKeyCredLink.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-017'
+            Category        = 'Shadow Credentials'
+            Title           = "Shadow Credentials: $($computersWithKeyCredLink.Count) computer account(s) have msDS-KeyCredentialLink set"
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($computersWithKeyCredLink.Count) computer account(s) have msDS-KeyCredentialLink set. In environments without WHfB device credentials, this attribute should be empty on computer accounts. Attackers with write access to computer objects (e.g., via RBCD or unconstrained delegation abuse) can leverage Shadow Credentials to authenticate as the machine account and extract its NTLM hash."
+            AffectedObjects = @($computersWithKeyCredLink | ForEach-Object { $_.DNSHostName })
+            Remediation     = '1) Review and clear unexpected msDS-KeyCredentialLink values on computer accounts. 2) Audit who has WriteProperty rights on computer objects. 3) Enable LDAP signing and channel binding to prevent relay attacks that could set this attribute.'
+            MitreAttack     = 'T1556'
+            References      = @('https://attack.mitre.org/techniques/T1556/', 'https://posts.specterops.io/shadow-credentials-abusing-key-trust-account-mapping-for-takeover-8ee1a53566ab')
+            VerificationCommand = 'Get-ADComputer -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object Name, @{n="KeyCredCount";e={$_."msDS-KeyCredentialLink".Count}}'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. ACL check: overly permissive WriteProperty on msDS-KeyCredentialLink
+    #    The msDS-KeyCredentialLink attribute GUID: 5b47d60f-6090-40b2-9f37-2a4de88f3063
+    # -----------------------------------------------------------------------
+    $keyCredLinkGuid = '5b47d60f-6090-40b2-9f37-2a4de88f3063'
+    $dangerousKeyCredACEs = @($ACLs | Where-Object {
+        $_ -and
+        ($_.ObjectType -eq $keyCredLinkGuid -or $_.ObjectType -eq '00000000-0000-0000-0000-000000000000') -and
+        ($_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll|WriteDacl|WriteOwner') -and
+        $_.AccessControlType -eq 'Allow' -and
+        $_.TargetObject -match 'CN=Users|CN=Computers|OU='
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        $ir -notmatch '^(NT AUTHORITY\\SYSTEM|BUILTIN\\Administrators|Domain Admins|Enterprise Admins|Domain Controllers|KEY ADMINS|ENTERPRISE KEY ADMINS)'
+    })
+
+    if ($dangerousKeyCredACEs.Count -gt 0) {
+        $uniquePrincipals = @($dangerousKeyCredACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-017'
+            Category        = 'Shadow Credentials'
+            Title           = "Shadow Credentials: $($uniquePrincipals.Count) non-standard principal(s) can write msDS-KeyCredentialLink"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($uniquePrincipals.Count) non-standard principal(s) have WriteProperty (or equivalent) rights on msDS-KeyCredentialLink or all properties on AD user/computer objects. Any of these principals can perform a Shadow Credentials attack to take over any account they have write access to, obtaining a TGT and NTLM hash without knowing the target password."
+            AffectedObjects = @($uniquePrincipals)
+            Remediation     = '1) Remove overpermissive WriteProperty rights on msDS-KeyCredentialLink. 2) Only Domain Controllers, KEY ADMINS, and ENTERPRISE KEY ADMINS should have this right. 3) Review GenericWrite/GenericAll ACEs on user and computer objects. 4) Add privileged accounts to Protected Users group.'
+            MitreAttack     = 'T1556'
+            References      = @('https://attack.mitre.org/techniques/T1556/', 'https://posts.specterops.io/shadow-credentials-abusing-key-trust-account-mapping-for-takeover-8ee1a53566ab', 'https://github.com/eladshamir/Whisker')
+            VerificationCommand = '(Get-ACL "AD:CN=Users,DC=domain,DC=com").Access | Where-Object { $_.ActiveDirectoryRights -match "WriteProperty|GenericWrite|GenericAll" } | Select-Object IdentityReference, ActiveDirectoryRights'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. Informational: Environment has no WHfB deployment indicator
+    #    If no users have msDS-KeyCredentialLink, flag as review point
+    # -----------------------------------------------------------------------
+    if ($usersWithKeyCredLink.Count -eq 0 -and $computersWithKeyCredLink.Count -eq 0 -and $dangerousKeyCredACEs.Count -eq 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-017'
+            Category        = 'Shadow Credentials'
+            Title           = 'Shadow Credentials: No msDS-KeyCredentialLink entries detected (verify)'
+            Severity        = 'Low'
+            Status          = 'Review'
+            Description     = 'No accounts with msDS-KeyCredentialLink were detected in the collected data. This may mean the attribute is clean (good) or that the LDAP collector did not retrieve this attribute. Verify collector configuration includes msDS-KeyCredentialLink in the property list. Also audit who has WriteProperty on this attribute to ensure Shadow Credentials attacks remain blocked.'
+            AffectedObjects = @()
+            Remediation     = 'Ensure LDAP collector fetches msDS-KeyCredentialLink. Periodically audit this attribute across all accounts. Restrict WriteProperty on msDS-KeyCredentialLink to DCs, KEY ADMINS, and ENTERPRISE KEY ADMINS only.'
+            MitreAttack     = 'T1556'
+            References      = @('https://attack.mitre.org/techniques/T1556/', 'https://posts.specterops.io/shadow-credentials-abusing-key-trust-account-mapping-for-takeover-8ee1a53566ab')
+            VerificationCommand = 'Get-ADUser -Filter * -Properties msDS-KeyCredentialLink | Where-Object { $_."msDS-KeyCredentialLink" } | Select-Object SamAccountName'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region ACLObjectControl
+
+function Invoke-ACLObjectControlCheck {
+    <#
+    .SYNOPSIS
+        Detects multi-hop ACL permission chains that enable privilege escalation (T1222.001).
+    .DESCRIPTION
+        ACL object control chaining exploits granular AD permissions across multiple objects to
+        escalate privileges indirectly. A single WriteDACL on a group → modifying the group →
+        adding self → gaining DA is a classic chain. This check identifies:
+          1. Non-standard principals with dangerous rights on high-value objects (Domain, AdminSDHolder,
+             Domain Controllers OU, privileged groups)
+          2. Accounts with WriteDACL / WriteOwner on domain-critical objects (enables full control)
+          3. Principals with GenericWrite / AllExtendedRights on user objects (enables password reset,
+             Kerberoasting, targeted AS-REP roasting)
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .PARAMETER Users
+        User objects from LDAP collector.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$ACLs  = @(),
+        [array]$Users = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    if ($ACLs.Count -eq 0) {
+        Write-Verbose "No ACL data provided; skipping ACL object control check."
+        return $findings.ToArray()
+    }
+
+    # Principals that are expected to have elevated rights (skip these to reduce noise)
+    $legitimatePrincipals = @(
+        'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'Domain Admins',
+        'Enterprise Admins', 'Schema Admins', 'Domain Controllers',
+        'Enterprise Domain Controllers', 'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS',
+        'CREATOR OWNER', 'BUILTIN\Account Operators'
+    )
+
+    # -----------------------------------------------------------------------
+    # 1. WriteDACL / WriteOwner on domain root or AdminSDHolder
+    #    These rights allow full control via DACL modification — the "God right" of AD
+    # -----------------------------------------------------------------------
+    $dacl_owner_ACEs = @($ACLs | Where-Object {
+        $_ -and
+        ($_.ActiveDirectoryRights -match 'WriteDacl|WriteOwner') -and
+        $_.AccessControlType -eq 'Allow' -and
+        ($_.TargetObject -match 'DC=|CN=AdminSDHolder')
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+    })
+
+    if ($dacl_owner_ACEs.Count -gt 0) {
+        $uniquePrincipals = @($dacl_owner_ACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-018'
+            Category        = 'ACL Object Control'
+            Title           = "ACL Chaining: $($uniquePrincipals.Count) principal(s) have WriteDACL/WriteOwner on domain root or AdminSDHolder"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($uniquePrincipals.Count) non-standard principal(s) have WriteDACL or WriteOwner on the domain root object or AdminSDHolder. These rights grant effective full control: the holder can modify the DACL to grant themselves any permission, then perform DCSync, object takeover, or persistent backdoor via AdminSDHolder. This is the most dangerous ACL misconfiguration in Active Directory."
+            AffectedObjects = @($uniquePrincipals)
+            Remediation     = '1) Immediately remove WriteDACL and WriteOwner from non-standard principals on the domain root and AdminSDHolder. 2) Investigate how these ACEs were added. 3) Run AD security health check tools (BloodHound, ADACLScanner) to identify further exposure. 4) Review all Domain Admin and EA group membership for unauthorized additions.'
+            MitreAttack     = 'T1222.001'
+            References      = @('https://attack.mitre.org/techniques/T1222/001/', 'https://adsecurity.org/?p=3658', 'https://github.com/BloodHoundAD/BloodHound')
+            VerificationCommand = '(Get-ACL "AD:DC=domain,DC=com").Access | Where-Object { $_.ActiveDirectoryRights -match "WriteDacl|WriteOwner" -and $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights, ObjectType'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. GenericWrite / AllExtendedRights on privileged group objects
+    #    Enables adding members to Domain Admins, Enterprise Admins, etc.
+    # -----------------------------------------------------------------------
+    $privilegedGroupACEs = @($ACLs | Where-Object {
+        $_ -and
+        ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|AllExtendedRights|WriteProperty') -and
+        $_.AccessControlType -eq 'Allow' -and
+        ($_.TargetObject -match 'CN=Domain Admins|CN=Enterprise Admins|CN=Schema Admins|CN=Administrators|CN=Group Policy Creator Owners|CN=Account Operators')
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+    })
+
+    if ($privilegedGroupACEs.Count -gt 0) {
+        $uniquePrincipals = @($privilegedGroupACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-018'
+            Category        = 'ACL Object Control'
+            Title           = "ACL Chaining: $($uniquePrincipals.Count) principal(s) have GenericWrite/AllExtendedRights on privileged groups"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($uniquePrincipals.Count) non-standard principal(s) have GenericWrite, GenericAll, or AllExtendedRights on privileged AD groups (Domain Admins, Enterprise Admins, etc.). This allows them to add themselves or arbitrary principals to those groups, enabling immediate privilege escalation to Domain Admin. This is a common ACL chaining attack path identified by BloodHound."
+            AffectedObjects = @($uniquePrincipals)
+            Remediation     = '1) Remove GenericWrite/GenericAll/AllExtendedRights from non-standard principals on privileged groups. 2) Audit all ACEs on Domain Admins, Enterprise Admins, and Schema Admins groups. 3) Enable auditing (Event ID 4728/4732/5136) for privileged group membership changes. 4) Use BloodHound to enumerate full attack paths.'
+            MitreAttack     = 'T1222.001'
+            References      = @('https://attack.mitre.org/techniques/T1222/001/', 'https://github.com/BloodHoundAD/BloodHound', 'https://www.ired.team/offensive-security-experiments/active-directory-kerberos-abuse/abusing-active-directory-acls-aces')
+            VerificationCommand = '(Get-ACL "AD:CN=Domain Admins,CN=Users,DC=domain,DC=com").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericWrite|GenericAll|AllExtendedRights" -and $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. ForceChangePassword / AllExtendedRights on DA/EA accounts
+    #    Allows password reset without knowing current password → immediate takeover
+    # -----------------------------------------------------------------------
+    $daAccounts = @($Users | Where-Object {
+        $_ -and $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'CN=Domain Admins|CN=Enterprise Admins' })
+    })
+    $daDistinguishedNames = @($daAccounts | Select-Object -ExpandProperty DistinguishedName -ErrorAction SilentlyContinue)
+
+    if ($daDistinguishedNames.Count -gt 0) {
+        $passwordResetACEs = @($ACLs | Where-Object {
+            $_ -and
+            ($_.ActiveDirectoryRights -match 'AllExtendedRights|GenericAll') -and
+            $_.AccessControlType -eq 'Allow' -and
+            ($daDistinguishedNames | Where-Object { $_.TargetObject -match [regex]::Escape($_) })
+        } | Where-Object {
+            $ir = $_.IdentityReference.ToString()
+            -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+        })
+
+        if ($passwordResetACEs.Count -gt 0) {
+            $uniquePrincipals = @($passwordResetACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+            $findings.Add([PSCustomObject]@{
+                RuleId          = 'ATK-018'
+                Category        = 'ACL Object Control'
+                Title           = "ACL Chaining: $($uniquePrincipals.Count) principal(s) can reset Domain Admin account passwords"
+                Severity        = 'Critical'
+                Status          = 'Finding'
+                Description     = "$($uniquePrincipals.Count) non-standard principal(s) have AllExtendedRights or GenericAll on Domain Admin or Enterprise Admin accounts. These rights include User-Force-Change-Password, allowing the holder to reset the DA account password without knowing the current password — enabling immediate account takeover and domain compromise."
+                AffectedObjects = @($uniquePrincipals)
+                Remediation     = '1) Remove AllExtendedRights/GenericAll from non-standard principals on DA/EA accounts. 2) Add all DA/EA accounts to Protected Users security group. 3) Enable fine-grained ACL auditing on privileged user objects. 4) Use BloodHound Shortest Path to DA to identify the complete attack graph.'
+                MitreAttack     = 'T1222.001'
+                References      = @('https://attack.mitre.org/techniques/T1222/001/', 'https://github.com/BloodHoundAD/BloodHound')
+                VerificationCommand = 'Get-ADGroupMember "Domain Admins" | ForEach-Object { (Get-ACL "AD:$($_.distinguishedName)").Access | Where-Object { $_.ActiveDirectoryRights -match "AllExtendedRights|GenericAll" -and $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights }'
+                Timestamp       = $now
+            })
+        }
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region AdminSDHolderAbuse
+
+function Invoke-AdminSDHolderAbuseCheck {
+    <#
+    .SYNOPSIS
+        Detects AdminSDHolder/SDProp persistence and abuse conditions (T1098).
+    .DESCRIPTION
+        AdminSDHolder is the template security descriptor for protected AD objects. SDProp runs
+        every 60 minutes and overwrites the ACLs of all protected accounts with the AdminSDHolder
+        ACL. This is commonly abused for persistence: add a backdoor ACE to AdminSDHolder and it
+        propagates automatically to all DA/EA/BA accounts, surviving manual ACL cleanup attempts.
+        This dedicated ATK check:
+          1. Flags non-standard ACEs on AdminSDHolder (attack vector for SDProp persistence)
+          2. Identifies orphaned AdminCount=1 accounts (SDProp no longer manages them but DACL is frozen)
+          3. Looks for large numbers of protected accounts (increases blast radius if AdminSDHolder is backdoored)
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .PARAMETER Users
+        User objects from LDAP collector.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$ACLs  = @(),
+        [array]$Users = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # Legitimate principals on AdminSDHolder
+    $legitimateAdminSDHolderPrincipals = @(
+        'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'Domain Admins',
+        'Enterprise Admins', 'BUILTIN\Pre-Windows 2000 Compatible Access',
+        'NT AUTHORITY\SELF', 'NT AUTHORITY\Authenticated Users',
+        'Domain Controllers', 'CREATOR OWNER', 'Everyone',
+        'Account Operators', 'Print Operators', 'Server Operators',
+        'Backup Operators', 'Replicator'
+    )
+
+    # -----------------------------------------------------------------------
+    # 1. Non-standard ACEs on AdminSDHolder object
+    # -----------------------------------------------------------------------
+    $adminSDHolderACEs = @($ACLs | Where-Object {
+        $_ -and $_.TargetObject -like '*CN=AdminSDHolder*'
+    })
+
+    if ($adminSDHolderACEs.Count -gt 0) {
+        $suspiciousACEs = @($adminSDHolderACEs | Where-Object {
+            $ace = $_
+            $ir  = $ace.IdentityReference.ToString()
+            ($ace.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|AllExtendedRights') -and
+            $ace.AccessControlType -eq 'Allow' -and
+            -not ($legitimateAdminSDHolderPrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+        })
+
+        if ($suspiciousACEs.Count -gt 0) {
+            $findings.Add([PSCustomObject]@{
+                RuleId          = 'ATK-019'
+                Category        = 'AdminSDHolder Abuse'
+                Title           = "AdminSDHolder/SDProp: $($suspiciousACEs.Count) suspicious ACE(s) on AdminSDHolder will propagate to all protected accounts"
+                Severity        = 'Critical'
+                Status          = 'Finding'
+                Description     = "$($suspiciousACEs.Count) non-standard ACE(s) with elevated permissions are present on the AdminSDHolder object (CN=AdminSDHolder,CN=System). The SDProp process runs every 60 minutes and stamps these ACEs onto all Domain Admins, Enterprise Admins, Backup Operators, and other protected accounts. An attacker who added these ACEs will silently retain persistent control over all protected accounts, even after manual ACL remediation of the protected accounts themselves."
+                AffectedObjects = @($suspiciousACEs | ForEach-Object { "$($_.IdentityReference) — $($_.ActiveDirectoryRights)" })
+                Remediation     = '1) IMMEDIATELY remove suspicious ACEs from AdminSDHolder: Set-ACL "AD:CN=AdminSDHolder,CN=System,DC=domain,DC=com". 2) Force SDProp to refresh all protected accounts: ldp.exe → Rootdse → runProtectAdminGroupsTask. 3) Investigate how ACEs were added (SIEM Event 5136 on AdminSDHolder). 4) Audit all DA/EA/BA accounts for residual unauthorized ACEs. 5) Alert on any future modifications to AdminSDHolder (Event ID 5136).'
+                MitreAttack     = 'T1098'
+                References      = @('https://attack.mitre.org/techniques/T1098/', 'https://adsecurity.org/?p=1906', 'https://www.semperis.com/blog/adminsdholder-abuse/')
+                VerificationCommand = '(Get-ACL "AD:CN=AdminSDHolder,CN=System,$(Get-ADDomain | Select-Object -ExpandProperty DistinguishedName)").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericAll|WriteDacl|WriteOwner" -and $_.AccessControlType -eq "Allow" } | Select-Object IdentityReference, ActiveDirectoryRights'
+                Timestamp       = $now
+            })
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. Orphaned AdminCount=1 accounts (not in protected groups, ACL not refreshed)
+    # -----------------------------------------------------------------------
+    $protectedGroupPatterns = 'Domain Admins|Enterprise Admins|Schema Admins|Administrators|Backup Operators|Account Operators|Server Operators|Print Operators|Replicators|Group Policy Creator Owners|Network Configuration Operators'
+
+    $orphanedAdminCount = @($Users | Where-Object {
+        $_ -and
+        $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1 -and
+        $_.Enabled -eq $true -and
+        $_.SamAccountName -notmatch '^(Administrator|krbtgt)$' -and
+        -not ($_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match $protectedGroupPatterns }))
+    })
+
+    if ($orphanedAdminCount.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-019'
+            Category        = 'AdminSDHolder Abuse'
+            Title           = "AdminSDHolder/SDProp: $($orphanedAdminCount.Count) orphaned AdminCount=1 account(s) — SDProp no longer managing their ACLs"
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($orphanedAdminCount.Count) enabled account(s) have AdminCount=1 but are no longer members of any protected group. SDProp no longer refreshes their ACLs, so their security descriptors are 'frozen' in the state when they were last protected. These accounts retain the tightened AdminSDHolder ACL (blocking inheritance) which can be exploited to hide permissions. Attackers specifically look for AdminCount=1 orphans as stealthy persistence targets."
+            AffectedObjects = @($orphanedAdminCount | ForEach-Object { $_.SamAccountName })
+            Remediation     = '1) Reset AdminCount to 0 on all orphaned accounts: Set-ADUser -Identity <account> -Replace @{AdminCount=0}. 2) Re-enable ACL inheritance on these objects. 3) Audit whether these accounts have unexpected local admin rights or group memberships. 4) Implement scheduled review of AdminCount=1 accounts.'
+            MitreAttack     = 'T1098'
+            References      = @('https://attack.mitre.org/techniques/T1098/', 'https://adsecurity.org/?p=2477', 'https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory')
+            VerificationCommand = 'Get-ADUser -Filter {AdminCount -eq 1} -Properties AdminCount, MemberOf | Select-Object SamAccountName, MemberOf | Sort-Object SamAccountName'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. SDProp blast radius assessment — how many accounts are protected
+    # -----------------------------------------------------------------------
+    $adminCountAccounts = @($Users | Where-Object {
+        $_ -and $_.PSObject.Properties['AdminCount'] -and $_.AdminCount -eq 1 -and $_.Enabled -eq $true
+    })
+
+    if ($adminCountAccounts.Count -gt 50) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-019'
+            Category        = 'AdminSDHolder Abuse'
+            Title           = "AdminSDHolder/SDProp: High protected account count ($($adminCountAccounts.Count)) — large SDProp blast radius"
+            Severity        = 'Medium'
+            Status          = 'Finding'
+            Description     = "$($adminCountAccounts.Count) enabled accounts have AdminCount=1, indicating they are (or were) in protected groups. A large protected account population increases the impact of AdminSDHolder backdooring: a single ACE added to AdminSDHolder propagates to all $($adminCountAccounts.Count) accounts within 60 minutes. Review whether all these accounts legitimately require protected-account status."
+            AffectedObjects = @($adminCountAccounts | ForEach-Object { $_.SamAccountName } | Select-Object -First 20)
+            Remediation     = '1) Audit all AdminCount=1 accounts. Remove from privileged groups any accounts that do not need them. 2) Reset AdminCount=0 for accounts no longer needing protection. 3) Monitor the size of protected groups over time — sudden increases indicate privilege escalation. 4) Consider implementing Tier 0/1/2 access model to limit protected account proliferation.'
+            MitreAttack     = 'T1098'
+            References      = @('https://attack.mitre.org/techniques/T1098/', 'https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory')
+            VerificationCommand = 'Get-ADUser -Filter {AdminCount -eq 1 -and Enabled -eq $true} -Properties AdminCount | Measure-Object | Select-Object Count'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region GPOAbuse
+
+function Invoke-GPOAbuseCheck {
+    <#
+    .SYNOPSIS
+        Detects conditions enabling GPO write-abuse for code execution and persistence (T1484.001).
+    .DESCRIPTION
+        Group Policy Objects (GPOs) represent a high-impact attack surface: a single GPO linked
+        to the Domain Objects or Domain Controllers OU can deploy malicious settings, scripts,
+        or scheduled tasks to thousands of machines simultaneously. This check:
+          1. Identifies non-admin principals with write permissions on GPO objects in AD
+          2. Identifies GPOs linked to sensitive OUs (Domain root, DC OU) with weak write ACLs
+          3. Checks for GPOs where Authenticated Users have write access (universal write surface)
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .PARAMETER GPOs
+        GPO objects from collector.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$ACLs = @(),
+        [array]$GPOs = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # Legitimate GPO management principals
+    $legitimateGPOPrincipals = @(
+        'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'Domain Admins',
+        'Enterprise Admins', 'CREATOR OWNER', 'Group Policy Creator Owners',
+        'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS'
+    )
+
+    # -----------------------------------------------------------------------
+    # 1. Non-admin write access on GPO objects in AD (CN=Policies,CN=System)
+    # -----------------------------------------------------------------------
+    $gpoWriteACEs = @($ACLs | Where-Object {
+        $_ -and
+        $_.TargetObject -match 'CN=Policies,CN=System|{[0-9A-Fa-f\-]{36}}' -and
+        ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteOwner|WriteProperty') -and
+        $_.AccessControlType -eq 'Allow'
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        -not ($legitimateGPOPrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+    })
+
+    if ($gpoWriteACEs.Count -gt 0) {
+        $uniquePrincipals = @($gpoWriteACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+        $uniqueGPOs       = @($gpoWriteACEs | Select-Object -ExpandProperty TargetObject -Unique)
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-020'
+            Category        = 'GPO Abuse'
+            Title           = "GPO Abuse: $($uniquePrincipals.Count) non-admin principal(s) have write access on $($uniqueGPOs.Count) GPO object(s)"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($uniquePrincipals.Count) non-standard principal(s) have GenericWrite, GenericAll, WriteDACL, WriteOwner, or WriteProperty rights on $($uniqueGPOs.Count) GPO object(s) in Active Directory. GPO write access enables immediate large-scale compromise: an attacker can add malicious startup scripts, schedule tasks, deploy software, or modify security settings. If the affected GPO is linked to the Domain root or DC OU, this enables domain-wide compromise from a single write operation."
+            AffectedObjects = @($uniquePrincipals)
+            Remediation     = '1) Remove non-admin write access from GPO objects. Only Group Policy Creator Owners, Domain Admins, and SYSTEM should have write rights. 2) Audit all GPO permissions using Get-GPPermissions. 3) Review GPOs linked to Domain root and DC OU for unauthorized changes. 4) Enable GPO change auditing (Event ID 5136 on GPO objects). 5) Implement GPO change approval workflow.'
+            MitreAttack     = 'T1484.001'
+            References      = @('https://attack.mitre.org/techniques/T1484/001/', 'https://adsecurity.org/?p=2716', 'https://github.com/FSecureLABS/SharpGPOAbuse')
+            VerificationCommand = 'Get-GPO -All | ForEach-Object { Get-GPPermissions -Guid $_.Id -All | Where-Object { $_.Permission -match "GpoEdit|GpoEditDeleteModifySecurity" } | Select-Object @{n="GPO";e={$_.Trustee.Name}}, Permission }'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. GPOs where Authenticated Users / Everyone has Create Child or Write
+    # -----------------------------------------------------------------------
+    $broadGPOACEs = @($ACLs | Where-Object {
+        $_ -and
+        $_.TargetObject -match 'CN=Policies,CN=System|{[0-9A-Fa-f\-]{36}}' -and
+        ($_.ActiveDirectoryRights -match 'CreateChild|WriteProperty|GenericWrite') -and
+        $_.AccessControlType -eq 'Allow' -and
+        ($_.IdentityReference -match 'Authenticated Users|Everyone|BUILTIN\\Users|Domain Users')
+    })
+
+    if ($broadGPOACEs.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-020'
+            Category        = 'GPO Abuse'
+            Title           = "GPO Abuse: Authenticated Users or Domain Users have write access on GPO objects"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "Authenticated Users, Everyone, or Domain Users have CreateChild, WriteProperty, or GenericWrite on one or more GPO objects. This means any authenticated domain user can modify these GPOs, enabling any compromised user account to perform large-scale malicious configuration deployment."
+            AffectedObjects = @($broadGPOACEs | Select-Object -ExpandProperty TargetObject -Unique)
+            Remediation     = '1) Immediately remove Authenticated Users / Domain Users write access from all GPOs. 2) GPO modify rights should be restricted to Domain Admins, Group Policy Creator Owners, and specific delegated GPO managers. 3) Audit all GPOs for overly broad permissions using Get-GPPermissions -All.'
+            MitreAttack     = 'T1484.001'
+            References      = @('https://attack.mitre.org/techniques/T1484/001/', 'https://github.com/FSecureLABS/SharpGPOAbuse')
+            VerificationCommand = 'Get-GPO -All | ForEach-Object { $gpo = $_; Get-GPPermissions -Guid $gpo.Id -All | Where-Object { $_.Trustee.SidType -eq "WellKnownGroup" } | Select-Object @{n="GPO";e={$gpo.DisplayName}}, Trustee, Permission }'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. GPO write-permission delegation review (informational if nothing found)
+    # -----------------------------------------------------------------------
+    if ($gpoWriteACEs.Count -eq 0 -and $broadGPOACEs.Count -eq 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-020'
+            Category        = 'GPO Abuse'
+            Title           = 'GPO Abuse: No overpermissive GPO write ACEs detected from ACL data (verify)'
+            Severity        = 'Low'
+            Status          = 'Review'
+            Description     = 'No non-admin write ACEs were detected on GPO objects from the collected ACL data. This may mean permissions are correctly configured, or that GPO ACL data was not fully collected (ACL collector may not enumerate CN=Policies,CN=System objects). Verify by running Get-GPPermissions against all GPOs and checking SYSVOL folder permissions.'
+            AffectedObjects = @()
+            Remediation     = '1) Verify GPO permission collection: Get-GPO -All | ForEach-Object { Get-GPPermissions -Guid $_.Id -All }. 2) Check SYSVOL folder ACLs for non-admin write access. 3) Enable GPO change auditing. 4) Periodically review delegated GPO management rights.'
+            MitreAttack     = 'T1484.001'
+            References      = @('https://attack.mitre.org/techniques/T1484/001/', 'https://github.com/FSecureLABS/SharpGPOAbuse')
+            VerificationCommand = 'Get-GPO -All | ForEach-Object { $gpo = $_; Get-GPPermissions -Guid $gpo.Id -All | Where-Object { $_.Permission -ne "GpoRead" } | Select-Object @{n="GPO";e={$gpo.DisplayName}}, Trustee, Permission }'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region CrossForestTrust
+
+function Invoke-CrossForestTrustCheck {
+    <#
+    .SYNOPSIS
+        Detects cross-forest and cross-domain trust exploitation conditions (T1199).
+    .DESCRIPTION
+        Trust relationships between domains and forests can be abused to escalate privileges
+        across organizational boundaries. Key risks include:
+          1. SID filtering disabled on cross-forest trusts (enables SID history injection)
+          2. Selectively authenticated trusts with broad authentication scope
+          3. One-way trusts where the trusted domain can authenticate against the trusting domain
+          4. Transitive trust chains enabling unexpected cross-forest access
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .PARAMETER Users
+        User objects from LDAP collector (to detect cross-domain accounts).
+    .PARAMETER DomainName
+        Domain DNS name.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$ACLs       = @(),
+        [array]$Users      = @(),
+        [string]$DomainName = $env:USERDNSDOMAIN
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # -----------------------------------------------------------------------
+    # 1. Enumerate trusts and check for SID filtering / quarantine status
+    # -----------------------------------------------------------------------
+    $trusts = @()
+    try {
+        $trusts = @(Get-ADTrust -Filter * -Properties TrustType, TrustDirection, TrustAttributes, SIDFilteringQuarantined, SIDFilteringForestAware -ErrorAction Stop)
+    }
+    catch {
+        Write-Verbose "Could not enumerate trusts (requires AD module or DC connectivity): $_"
+    }
+
+    if ($trusts.Count -gt 0) {
+        # SID filtering disabled trusts (quarantine = false on external trusts)
+        $unquarantinedTrusts = @($trusts | Where-Object {
+            $_.SIDFilteringQuarantined -eq $false -and
+            $_.TrustType -ne 'Kerberos' -and
+            $_.TrustType -ne 'Uplevel'
+        })
+
+        if ($unquarantinedTrusts.Count -gt 0) {
+            $findings.Add([PSCustomObject]@{
+                RuleId          = 'ATK-021'
+                Category        = 'Cross-Forest Trust Abuse'
+                Title           = "Cross-Forest Trust: $($unquarantinedTrusts.Count) trust(s) have SID filtering (quarantine) disabled"
+                Severity        = 'Critical'
+                Status          = 'Finding'
+                Description     = "$($unquarantinedTrusts.Count) domain trust(s) have SID Filtering (Quarantine) disabled. Without SID filtering, a compromised trusted domain can inject arbitrary SID history values (including Enterprise Admins S-1-5-21-*-519) into Kerberos tickets, enabling privilege escalation in the trusting domain. This is the most dangerous cross-domain trust misconfiguration."
+                AffectedObjects = @($unquarantinedTrusts | ForEach-Object { "$($_.Name) ($($_.TrustDirection), Type: $($_.TrustType))" })
+                Remediation     = '1) Enable SID filtering on all external trusts: netdom trust <TrustingDomain> /domain:<TrustedDomain> /EnableSIDHistory:no. 2) For forest trusts, enable SID filtering forest-aware. 3) Review all trust relationships and remove unnecessary trusts. 4) Deploy Selective Authentication on all external trusts.'
+                MitreAttack     = 'T1199'
+                References      = @('https://attack.mitre.org/techniques/T1199/', 'https://adsecurity.org/?p=1588', 'https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/cc772513(v=ws.10)')
+                VerificationCommand = 'Get-ADTrust -Filter * -Properties SIDFilteringQuarantined | Select-Object Name, TrustDirection, TrustType, SIDFilteringQuarantined'
+                Timestamp       = $now
+            })
+        }
+
+        # Bidirectional or full-trust forest trusts (increased lateral movement surface)
+        # TRUST_ATTRIBUTE_FOREST_TRANSITIVE = 0x8 (bit 3) — set when TrustAttributes includes forest transitive trust
+        $TRUST_ATTRIBUTE_FOREST_TRANSITIVE = 8
+        $bidirectionalForestTrusts = @($trusts | Where-Object {
+            $_.TrustDirection -eq 'BiDirectional' -and
+            ($_.TrustType -eq 'Forest' -or ($_.TrustAttributes -band $TRUST_ATTRIBUTE_FOREST_TRANSITIVE) -eq $TRUST_ATTRIBUTE_FOREST_TRANSITIVE)
+        })
+
+        if ($bidirectionalForestTrusts.Count -gt 0) {
+            $findings.Add([PSCustomObject]@{
+                RuleId          = 'ATK-021'
+                Category        = 'Cross-Forest Trust Abuse'
+                Title           = "Cross-Forest Trust: $($bidirectionalForestTrusts.Count) bidirectional forest trust(s) — mutual compromise risk"
+                Severity        = 'High'
+                Status          = 'Finding'
+                Description     = "$($bidirectionalForestTrusts.Count) bidirectional forest trust(s) exist. Bidirectional trusts mean both forests trust each other, and compromise in either forest can be leveraged to attack the other. An attacker who achieves Domain Admin in one forest can use the trust to enumerate and attack resources in the partner forest. Forest-level trusts are transitive within each forest."
+                AffectedObjects = @($bidirectionalForestTrusts | ForEach-Object { $_.Name })
+                Remediation     = '1) Review whether bidirectional forest trusts are necessary. Convert to one-way trusts where possible. 2) Enable Selective Authentication on all forest trusts. 3) Audit which AD groups in the trusted forest have access to resources in the trusting forest. 4) Treat partner forests with the same security rigor as your own forest.'
+                MitreAttack     = 'T1199'
+                References      = @('https://attack.mitre.org/techniques/T1199/', 'https://posts.specterops.io/not-a-security-boundary-breaking-forest-trusts-cd125829518d')
+                VerificationCommand = 'Get-ADTrust -Filter * -Properties TrustAttributes | Where-Object { $_.TrustDirection -eq "BiDirectional" } | Select-Object Name, TrustDirection, TrustType, TrustAttributes'
+                Timestamp       = $now
+            })
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. Cross-domain accounts with elevated rights in the local domain
+    #    These are accounts from trusted domains with local domain admin rights
+    # -----------------------------------------------------------------------
+    $crossDomainPrivileged = @($Users | Where-Object {
+        $_ -and
+        $_.PSObject.Properties['SID'] -and $_.SID -and
+        $DomainName -and
+        # Account SID not from local domain (different domain prefix)
+        $_.SamAccountName -match '\$' -eq $false -and
+        $_.MemberOf -and ($_.MemberOf | Where-Object { $_ -match 'Domain Admins|Enterprise Admins' })
+    } | Where-Object {
+        # Filter for accounts whose UPN suggests a different domain
+        $_.PSObject.Properties['UserPrincipalName'] -and $_.UserPrincipalName -and
+        $_.UserPrincipalName -notmatch [regex]::Escape($DomainName)
+    })
+
+    if ($crossDomainPrivileged.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-021'
+            Category        = 'Cross-Forest Trust Abuse'
+            Title           = "Cross-Forest Trust: $($crossDomainPrivileged.Count) external-domain account(s) have local privileged group membership"
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($crossDomainPrivileged.Count) account(s) with UPNs from external domains are members of privileged groups (Domain Admins or Enterprise Admins) in this domain. Cross-domain privileged access increases the attack surface: compromise of the external domain can immediately translate to compromise of this domain through these account memberships."
+            AffectedObjects = @($crossDomainPrivileged | ForEach-Object { "$($_.SamAccountName) — $($_.UserPrincipalName)" })
+            Remediation     = '1) Review all cross-domain accounts with local privileged group membership. Remove if not required. 2) Prefer resource-based access (local groups in specific resources) over privileged group membership for cross-domain access. 3) Audit the security posture of partner domains that have accounts with local admin rights.'
+            MitreAttack     = 'T1199'
+            References      = @('https://attack.mitre.org/techniques/T1199/', 'https://adsecurity.org/?p=1588')
+            VerificationCommand = 'Get-ADGroupMember "Domain Admins" -Recursive | Where-Object { $_.objectClass -eq "user" } | Get-ADUser -Properties UserPrincipalName | Where-Object { $_.UserPrincipalName -notmatch "' + $DomainName + '" } | Select-Object SamAccountName, UserPrincipalName'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. Informational: No trust data available from collector
+    # -----------------------------------------------------------------------
+    if ($trusts.Count -eq 0 -and $crossDomainPrivileged.Count -eq 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-021'
+            Category        = 'Cross-Forest Trust Abuse'
+            Title           = 'Cross-Forest Trust: No trust data collected — manual verification required'
+            Severity        = 'Low'
+            Status          = 'Review'
+            Description     = 'No domain trust information was returned from the collector (requires AD module / DC connectivity). Cross-forest trust abuse is a significant attack vector that cannot be fully assessed without trust enumeration. Perform manual review of all trust relationships.'
+            AffectedObjects = @()
+            Remediation     = '1) Run: Get-ADTrust -Filter * -Properties * to enumerate all trusts. 2) Verify SID filtering is enabled on all external/forest trusts. 3) Implement Selective Authentication on all trusts. 4) Review cross-domain accounts with local privileged membership.'
+            MitreAttack     = 'T1199'
+            References      = @('https://attack.mitre.org/techniques/T1199/', 'https://adsecurity.org/?p=1588', 'https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/cc772513(v=ws.10)')
+            VerificationCommand = 'Get-ADTrust -Filter * -Properties SIDFilteringQuarantined, TrustAttributes | Select-Object Name, TrustDirection, TrustType, SIDFilteringQuarantined, TrustAttributes'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
+#region RBCDAbuse
+
+function Invoke-RBCDCheck {
+    <#
+    .SYNOPSIS
+        Detects Resource-Based Constrained Delegation (RBCD) misconfigurations and abuse paths (T1134.001).
+    .DESCRIPTION
+        RBCD (configured via msDS-AllowedToActOnBehalfOfOtherIdentity) enables service impersonation
+        without requiring DA privileges to configure. An attacker who gains write access to a computer
+        object can set RBCD to allow any account they control to impersonate any user to that service.
+        Combined with MachineAccountQuota > 0, this creates a full privilege-escalation path from
+        zero credentials. This check:
+          1. Finds computer accounts with msDS-AllowedToActOnBehalfOfOtherIdentity set (RBCD configured)
+          2. Identifies non-admin accounts with WriteProperty/GenericWrite on computer objects
+             (RBCD write path)
+          3. Checks for MachineAccountQuota enabling attacker-controlled computer account creation
+    .PARAMETER Computers
+        Computer objects from LDAP collector.
+    .PARAMETER ACLs
+        ACL objects from LDAP collector.
+    .PARAMETER Users
+        User objects from LDAP collector.
+    .OUTPUTS
+        Array of PSCustomObject findings.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Computers = @(),
+        [array]$ACLs      = @(),
+        [array]$Users     = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $now      = Get-Date
+
+    # -----------------------------------------------------------------------
+    # 1. Computers with msDS-AllowedToActOnBehalfOfOtherIdentity set (RBCD configured)
+    #    Review whether these are legitimate delegations or attacker-planted
+    # -----------------------------------------------------------------------
+    $rbcdComputers = @($Computers | Where-Object {
+        $_ -and
+        $_.PSObject.Properties['msDS-AllowedToActOnBehalfOfOtherIdentity'] -and
+        $_.'msDS-AllowedToActOnBehalfOfOtherIdentity'
+    })
+
+    if ($rbcdComputers.Count -gt 0) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-022'
+            Category        = 'RBCD Abuse'
+            Title           = "RBCD: $($rbcdComputers.Count) computer object(s) have msDS-AllowedToActOnBehalfOfOtherIdentity configured"
+            Severity        = 'High'
+            Status          = 'Finding'
+            Description     = "$($rbcdComputers.Count) computer object(s) have Resource-Based Constrained Delegation (RBCD) configured via the msDS-AllowedToActOnBehalfOfOtherIdentity attribute. Verify these delegations are intentional and necessary. Attackers who gain write access to a computer object set this attribute to allow an attacker-controlled account to impersonate any domain user (including DA) to reach the target service — a complete privilege escalation path requiring no special privileges to configure."
+            AffectedObjects = @($rbcdComputers | ForEach-Object { $_.DNSHostName })
+            Remediation     = '1) Audit all computers with msDS-AllowedToActOnBehalfOfOtherIdentity: Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object { $_."msDS-AllowedToActOnBehalfOfOtherIdentity" }. 2) Clear RBCD on systems where it is not required: Set-ADComputer <name> -Clear msDS-AllowedToActOnBehalfOfOtherIdentity. 3) Restrict who can write to computer objects (msDS-AllowedToActOnBehalfOfOtherIdentity attribute). 4) Add high-value accounts to Protected Users group (blocks delegation).'
+            MitreAttack     = 'T1134.001'
+            References      = @('https://attack.mitre.org/techniques/T1134/001/', 'https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html', 'https://www.harmj0y.net/blog/activedirectory/a-case-study-in-wagging-the-dog-computer-takeover/')
+            VerificationCommand = 'Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object { $_."msDS-AllowedToActOnBehalfOfOtherIdentity" } | Select-Object Name, DNSHostName'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. Non-admin accounts with WriteProperty on computer objects
+    #    This is the prerequisite for planting RBCD — if you can write to a computer, you can set RBCD
+    # -----------------------------------------------------------------------
+    $legitimateComputerWritePrincipals = @(
+        'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'Domain Admins',
+        'Enterprise Admins', 'CREATOR OWNER', 'Domain Controllers',
+        'Account Operators'
+    )
+
+    $computerWriteACEs = @($ACLs | Where-Object {
+        $_ -and
+        $_.TargetObject -match 'CN=Computers|OU=' -and
+        ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteProperty') -and
+        $_.AccessControlType -eq 'Allow'
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        -not ($legitimateComputerWritePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
+    })
+
+    if ($computerWriteACEs.Count -gt 0) {
+        $uniquePrincipals = @($computerWriteACEs | Select-Object -ExpandProperty IdentityReference -Unique)
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-022'
+            Category        = 'RBCD Abuse'
+            Title           = "RBCD: $($uniquePrincipals.Count) non-admin principal(s) can write to computer objects (RBCD plant path)"
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = "$($uniquePrincipals.Count) non-standard principal(s) have GenericWrite, GenericAll, or WriteProperty on computer objects. WriteProperty on a computer object includes the ability to set msDS-AllowedToActOnBehalfOfOtherIdentity. Combined with MachineAccountQuota > 0 (enabling attacker to create a machine account), this provides a complete RBCD privilege escalation path: any domain user with write access to a computer object can potentially become Domain Admin via S4U2Self/S4U2Proxy delegation abuse."
+            AffectedObjects = @($uniquePrincipals)
+            Remediation     = '1) Remove GenericWrite/WriteProperty from non-admin principals on computer objects. 2) Set MachineAccountQuota to 0. 3) Audit RBCD configurations on all computer objects. 4) Deploy Protected Users for high-value accounts. 5) Use BloodHound to enumerate complete RBCD attack paths in your environment.'
+            MitreAttack     = 'T1134.001'
+            References      = @('https://attack.mitre.org/techniques/T1134/001/', 'https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html', 'https://github.com/BloodHoundAD/BloodHound')
+            VerificationCommand = 'Get-ADComputer -Filter * | ForEach-Object { $computer = $_; (Get-ACL "AD:$($computer.DistinguishedName)").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericWrite|WriteProperty" -and $_.AccessControlType -eq "Allow" } | Select-Object @{n="Computer";e={$computer.Name}}, IdentityReference, ActiveDirectoryRights }'
+            Timestamp       = $now
+        })
+    }
+
+    # -----------------------------------------------------------------------
+    # 3. MachineAccountQuota > 0 combined with delegation surface
+    #    (RBCD escalation requires attacker-controlled machine account)
+    # -----------------------------------------------------------------------
+    $maqVulnerable = $false
+    try {
+        $domainRoot = Get-ADObject -SearchBase (Get-ADDomain).DistinguishedName -Filter { objectClass -eq 'domain' } -Properties 'ms-DS-MachineAccountQuota' -ErrorAction Stop
+        $maq = if ($domainRoot.PSObject.Properties['ms-DS-MachineAccountQuota']) { $domainRoot.'ms-DS-MachineAccountQuota' } else { 10 }
+        $maqVulnerable = ($maq -gt 0)
+    }
+    catch {
+        Write-Verbose "Could not check MachineAccountQuota (requires DC access): $_"
+    }
+
+    if ($maqVulnerable -and ($rbcdComputers.Count -gt 0 -or $computerWriteACEs.Count -gt 0)) {
+        $findings.Add([PSCustomObject]@{
+            RuleId          = 'ATK-022'
+            Category        = 'RBCD Abuse'
+            Title           = 'RBCD: MachineAccountQuota > 0 combined with RBCD write surface — complete escalation path present'
+            Severity        = 'Critical'
+            Status          = 'Finding'
+            Description     = 'MachineAccountQuota is greater than 0, allowing any authenticated domain user to create machine accounts. Combined with write access to existing computer objects (allowing RBCD planting), this provides a complete privilege escalation path: (1) create attacker-controlled computer account, (2) write msDS-AllowedToActOnBehalfOfOtherIdentity on a target computer to allow the attacker account to delegate, (3) use S4U2Self + S4U2Proxy to obtain service tickets as any user (including DA) to the target service.'
+            AffectedObjects = @('MachineAccountQuota > 0', "$($computerWriteACEs.Count) computer write ACEs detected")
+            Remediation     = '1) CRITICAL: Set MachineAccountQuota to 0 immediately. 2) Remove non-admin write access from computer objects. 3) Clear all existing RBCD configurations that are not intentional. 4) Audit recently created computer accounts for attacker-planted machines.'
+            MitreAttack     = 'T1134.001'
+            References      = @('https://attack.mitre.org/techniques/T1134/001/', 'https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html')
+            VerificationCommand = 'Get-ADObject -LDAPFilter "(objectClass=domain)" -Properties ms-DS-MachineAccountQuota | Select-Object Name,"ms-DS-MachineAccountQuota"'
+            Timestamp       = $now
+        })
+    }
+
+    return $findings.ToArray()
+}
+
+#endregion
+
 #region Orchestrator
 
 function Invoke-AllOffensiveTechniqueChecks {
@@ -1403,9 +2255,10 @@ function Invoke-AllOffensiveTechniqueChecks {
     $ntlm        = @(if ($CollectedData.ContainsKey('NtlmSettings')) { $CollectedData.NtlmSettings } else { @() })
     $cas         = @(if ($CollectedData.ContainsKey('CertificateAuthorities')) { $CollectedData.CertificateAuthorities } else { @() })
     $templates   = @(if ($CollectedData.ContainsKey('CertificateTemplates'))   { $CollectedData.CertificateTemplates }   else { @() })
+    $gpos        = @(if ($CollectedData.ContainsKey('GPOs'))         { $CollectedData.GPOs }         else { @() })
 
     $checks = @(
-        { Invoke-PasswordSprayingCheck   -PasswordPolicies $pwPolicies -Users $users }
+        { Invoke-PasswordSprayingCheck    -PasswordPolicies $pwPolicies -Users $users }
         { Invoke-MachineAccountQuotaCheck -DomainName $DomainName }
         { Invoke-GoldenTicketCheck        -Users $users -DomainControllers $dcs }
         { Invoke-SilverTicketCheck        -Users $users -Computers $computers }
@@ -1419,6 +2272,12 @@ function Invoke-AllOffensiveTechniqueChecks {
         { Invoke-NTLMRelayCheck           -DomainControllers $dcs -SmbSigningData $smbSigning -LdapSigningData $ldapSigning -NtlmData $ntlm }
         { Invoke-CredentialDumpingCheck   -DomainControllers $dcs -Users $users -Computers $computers }
         { Invoke-LateralMovementCheck     -Users $users -Computers $computers -DomainControllers $dcs -ACLs $acls -DomainName $DomainName }
+        { Invoke-ShadowCredentialsCheck   -Users $users -Computers $computers -ACLs $acls }
+        { Invoke-ACLObjectControlCheck    -ACLs $acls -Users $users }
+        { Invoke-AdminSDHolderAbuseCheck  -ACLs $acls -Users $users }
+        { Invoke-GPOAbuseCheck            -ACLs $acls -GPOs $gpos }
+        { Invoke-CrossForestTrustCheck    -ACLs $acls -Users $users -DomainName $DomainName }
+        { Invoke-RBCDCheck                -Computers $computers -ACLs $acls -Users $users }
     )
 
     foreach ($check in $checks) {
