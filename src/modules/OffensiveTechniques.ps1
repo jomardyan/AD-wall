@@ -1479,8 +1479,10 @@ function Invoke-ShadowCredentialsCheck {
         ($_.ObjectType -eq $keyCredLinkGuid -or $_.ObjectType -eq '00000000-0000-0000-0000-000000000000') -and
         ($_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll|WriteDacl|WriteOwner') -and
         $_.AccessControlType -eq 'Allow' -and
-        $_.IdentityReference -notmatch '^(NT AUTHORITY\\SYSTEM|BUILTIN\\Administrators|Domain Admins|Enterprise Admins|Domain Controllers|KEY ADMINS|ENTERPRISE KEY ADMINS)' -and
         $_.TargetObject -match 'CN=Users|CN=Computers|OU='
+    } | Where-Object {
+        $ir = $_.IdentityReference.ToString()
+        $ir -notmatch '^(NT AUTHORITY\\SYSTEM|BUILTIN\\Administrators|Domain Admins|Enterprise Admins|Domain Controllers|KEY ADMINS|ENTERPRISE KEY ADMINS)'
     })
 
     if ($dangerousKeyCredACEs.Count -gt 0) {
@@ -1579,8 +1581,7 @@ function Invoke-ACLObjectControlCheck {
         $_ -and
         ($_.ActiveDirectoryRights -match 'WriteDacl|WriteOwner') -and
         $_.AccessControlType -eq 'Allow' -and
-        ($_.TargetObject -match 'DC=|CN=AdminSDHolder') -and
-        -not ($legitimatePrincipals | Where-Object { $_.IdentityReference -match [regex]::Escape($_) })
+        ($_.TargetObject -match 'DC=|CN=AdminSDHolder')
     } | Where-Object {
         $ir = $_.IdentityReference.ToString()
         -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
@@ -1612,8 +1613,7 @@ function Invoke-ACLObjectControlCheck {
         $_ -and
         ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|AllExtendedRights|WriteProperty') -and
         $_.AccessControlType -eq 'Allow' -and
-        ($_.TargetObject -match 'CN=Domain Admins|CN=Enterprise Admins|CN=Schema Admins|CN=Administrators|CN=Group Policy Creator Owners|CN=Account Operators') -and
-        -not ($legitimatePrincipals | Where-Object { $_.IdentityReference -match [regex]::Escape($_) })
+        ($_.TargetObject -match 'CN=Domain Admins|CN=Enterprise Admins|CN=Schema Admins|CN=Administrators|CN=Group Policy Creator Owners|CN=Account Operators')
     } | Where-Object {
         $ir = $_.IdentityReference.ToString()
         -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
@@ -1651,8 +1651,7 @@ function Invoke-ACLObjectControlCheck {
             $_ -and
             ($_.ActiveDirectoryRights -match 'AllExtendedRights|GenericAll') -and
             $_.AccessControlType -eq 'Allow' -and
-            ($daDistinguishedNames | Where-Object { $_.TargetObject -match [regex]::Escape($_) }) -and
-            -not ($legitimatePrincipals | Where-Object { $_.IdentityReference -match [regex]::Escape($_) })
+            ($daDistinguishedNames | Where-Object { $_.TargetObject -match [regex]::Escape($_) })
         } | Where-Object {
             $ir = $_.IdentityReference.ToString()
             -not ($legitimatePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
@@ -1859,8 +1858,7 @@ function Invoke-GPOAbuseCheck {
         $_ -and
         $_.TargetObject -match 'CN=Policies,CN=System|{[0-9A-Fa-f\-]{36}}' -and
         ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteOwner|WriteProperty') -and
-        $_.AccessControlType -eq 'Allow' -and
-        -not ($legitimateGPOPrincipals | Where-Object { $_.IdentityReference -match [regex]::Escape($_) })
+        $_.AccessControlType -eq 'Allow'
     } | Where-Object {
         $ir = $_.IdentityReference.ToString()
         -not ($legitimateGPOPrincipals | Where-Object { $ir -match [regex]::Escape($_) })
@@ -1908,7 +1906,7 @@ function Invoke-GPOAbuseCheck {
             Remediation     = '1) Immediately remove Authenticated Users / Domain Users write access from all GPOs. 2) GPO modify rights should be restricted to Domain Admins, Group Policy Creator Owners, and specific delegated GPO managers. 3) Audit all GPOs for overly broad permissions using Get-GPPermissions -All.'
             MitreAttack     = 'T1484.001'
             References      = @('https://attack.mitre.org/techniques/T1484/001/', 'https://github.com/FSecureLABS/SharpGPOAbuse')
-            VerificationCommand = 'Get-GPO -All | ForEach-Object { Get-GPPermissions -Guid $_.Id -All | Where-Object { $_.Trustee.SidType -eq "WellKnownGroup" } | Select-Object @{n="GPO";e={$using:_.DisplayName}}, Trustee, Permission }'
+            VerificationCommand = 'Get-GPO -All | ForEach-Object { $gpo = $_; Get-GPPermissions -Guid $gpo.Id -All | Where-Object { $_.Trustee.SidType -eq "WellKnownGroup" } | Select-Object @{n="GPO";e={$gpo.DisplayName}}, Trustee, Permission }'
             Timestamp       = $now
         })
     }
@@ -2007,9 +2005,11 @@ function Invoke-CrossForestTrustCheck {
         }
 
         # Bidirectional or full-trust forest trusts (increased lateral movement surface)
+        # TRUST_ATTRIBUTE_FOREST_TRANSITIVE = 0x8 (bit 3) — set when TrustAttributes includes forest transitive trust
+        $TRUST_ATTRIBUTE_FOREST_TRANSITIVE = 8
         $bidirectionalForestTrusts = @($trusts | Where-Object {
             $_.TrustDirection -eq 'BiDirectional' -and
-            ($_.TrustType -eq 'Forest' -or ($_.TrustAttributes -band 8) -eq 8)
+            ($_.TrustType -eq 'Forest' -or ($_.TrustAttributes -band $TRUST_ATTRIBUTE_FOREST_TRANSITIVE) -eq $TRUST_ATTRIBUTE_FOREST_TRANSITIVE)
         })
 
         if ($bidirectionalForestTrusts.Count -gt 0) {
@@ -2165,8 +2165,7 @@ function Invoke-RBCDCheck {
         $_ -and
         $_.TargetObject -match 'CN=Computers|OU=' -and
         ($_.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteProperty') -and
-        $_.AccessControlType -eq 'Allow' -and
-        -not ($legitimateComputerWritePrincipals | Where-Object { $_.IdentityReference -match [regex]::Escape($_) })
+        $_.AccessControlType -eq 'Allow'
     } | Where-Object {
         $ir = $_.IdentityReference.ToString()
         -not ($legitimateComputerWritePrincipals | Where-Object { $ir -match [regex]::Escape($_) })
@@ -2185,7 +2184,7 @@ function Invoke-RBCDCheck {
             Remediation     = '1) Remove GenericWrite/WriteProperty from non-admin principals on computer objects. 2) Set MachineAccountQuota to 0. 3) Audit RBCD configurations on all computer objects. 4) Deploy Protected Users for high-value accounts. 5) Use BloodHound to enumerate complete RBCD attack paths in your environment.'
             MitreAttack     = 'T1134.001'
             References      = @('https://attack.mitre.org/techniques/T1134/001/', 'https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html', 'https://github.com/BloodHoundAD/BloodHound')
-            VerificationCommand = 'Get-ADComputer -Filter * | ForEach-Object { (Get-ACL "AD:$($_.DistinguishedName)").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericWrite|WriteProperty" -and $_.AccessControlType -eq "Allow" } | Select-Object @{n="Computer";e={$using:_.Name}}, IdentityReference, ActiveDirectoryRights }'
+            VerificationCommand = 'Get-ADComputer -Filter * | ForEach-Object { $computer = $_; (Get-ACL "AD:$($computer.DistinguishedName)").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericWrite|WriteProperty" -and $_.AccessControlType -eq "Allow" } | Select-Object @{n="Computer";e={$computer.Name}}, IdentityReference, ActiveDirectoryRights }'
             Timestamp       = $now
         })
     }

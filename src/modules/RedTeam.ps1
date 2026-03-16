@@ -1465,6 +1465,7 @@ function Invoke-RedTeamShadowCredentials {
     })
 
     # Enumerate principals with WriteProperty on msDS-KeyCredentialLink or GenericWrite on user/computer objects
+    # GUID 5b47d60f-6090-40b2-9f37-2a4de88f3063 = msDS-KeyCredentialLink attribute schemaIdGuid
     $keyCredLinkGuid = '5b47d60f-6090-40b2-9f37-2a4de88f3063'
     $writeTargets = @()
     if (-not $SafeMode) {
