@@ -18,6 +18,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from functools import lru_cache
+
 from flask import Flask, render_template, jsonify, request, send_file, abort
 
 # ---------------------------------------------------------------------------
@@ -30,6 +32,44 @@ if _SRC_DIR not in sys.path:
 import core.db as db
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Response compression — gzip JSON/HTML responses automatically
+# ---------------------------------------------------------------------------
+import gzip as _gzip_mod
+
+@app.after_request
+def _compress_response(response):
+    """Gzip responses larger than 500 bytes when the client supports it."""
+    if (
+        response.status_code < 200
+        or response.status_code >= 300
+        or response.direct_passthrough
+        or "Content-Encoding" in response.headers
+        or not response.content_length
+        or response.content_length < 500
+    ):
+        return response
+    accept_enc = request.headers.get("Accept-Encoding", "")
+    if "gzip" not in accept_enc:
+        return response
+    data = response.get_data()
+    compressed = _gzip_mod.compress(data, compresslevel=6)
+    if len(compressed) >= len(data):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = len(compressed)
+    response.headers["Vary"] = "Accept-Encoding"
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Lightweight in-memory cache for snapshot metadata (invalidated after 30 s)
+# ---------------------------------------------------------------------------
+_snapshot_cache: dict = {"data": None, "ts": 0}
+_SNAPSHOT_CACHE_TTL = 30  # seconds
 
 # Evidence store directory — override via ADWALL_DATA_DIR env var
 DATA_DIR = os.environ.get("ADWALL_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "output"))
@@ -206,14 +246,35 @@ def api_findings():
 
 @app.route("/api/score")
 def api_score():
-    """Return the overall posture grade and score, with optional run_id filter."""
+    """Return the overall posture grade and score, with optional run_id filter.
+
+    Uses SQL aggregation (GROUP BY) instead of loading all findings into Python.
+    """
     run_id = request.args.get("run_id")
 
     if run_id:
-        assessment = _assessment_for_run(run_id)
+        run = db.get_run(run_id)
     else:
-        assessment = _latest_assessment()
+        runs = db.list_runs(limit=1)
+        run = next((r for r in runs if r.get("status") == "completed"), None)
 
+    if run:
+        # Fast path: aggregate counts in SQL
+        severity_counts = db.get_severity_counts(run["id"])
+        category_counts = db.get_category_counts(run["id"])
+        return jsonify({
+            "grade":          run.get("grade", "N/A"),
+            "score":          run.get("score", 0),
+            "description":    "",
+            "severityCounts": severity_counts,
+            "categoryCounts": category_counts,
+            "totalFindings":  run.get("total_findings", 0),
+            "generatedAt":    run.get("completed_at") or run.get("started_at"),
+            "run_id":         run["id"],
+        })
+
+    # Fallback to JSON files
+    assessment = _latest_assessment()
     if not assessment:
         return jsonify({"error": "No assessment data found"}), 404
 
@@ -221,12 +282,10 @@ def api_score():
     findings = _get_findings(assessment)
 
     severity_counts = {}
+    category_counts = {}
     for f in findings:
         sev = f.get("Severity", "Unknown")
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
-
-    category_counts = {}
-    for f in findings:
         cat = f.get("Category", "Unknown")
         category_counts[cat] = category_counts.get(cat, 0) + 1
 
@@ -244,15 +303,39 @@ def api_score():
 
 @app.route("/api/snapshots")
 def api_snapshots():
-    """List all available assessment snapshots."""
-    files = _list_assessment_files()
+    """List all available assessment snapshots (cached for 30 s)."""
+    now = time.time()
+    if _snapshot_cache["data"] is not None and (now - _snapshot_cache["ts"]) < _SNAPSHOT_CACHE_TTL:
+        return jsonify(_snapshot_cache["data"])
+
+    # Prefer DB runs (fast) — only fall back to JSON files for legacy data
+    runs = db.list_runs(limit=200)
     snapshots = []
+    for r in runs:
+        if r.get("status") != "completed":
+            continue
+        snapshots.append({
+            "file": r.get("id", ""),
+            "generatedAt": r.get("completed_at") or r.get("started_at"),
+            "grade": r.get("grade", "N/A"),
+            "score": r.get("score", 0),
+            "totalFindings": r.get("total_findings", 0),
+            "criticalCount": r.get("critical_count", 0),
+            "highCount": r.get("high_count", 0),
+        })
+
+    # Include any JSON files not yet imported
+    imported_ids = {s["file"] for s in snapshots}
+    files = _list_assessment_files()
     for f in files:
+        basename = os.path.basename(f)
+        if any(basename in rid for rid in imported_ids):
+            continue
         try:
             data = _load_assessment(f)
             grade_obj = data.get("PostureGrade") or {}
             snapshots.append({
-                "file": os.path.basename(f),
+                "file": basename,
                 "generatedAt": data.get("GeneratedAt"),
                 "grade": grade_obj.get("Grade", "N/A"),
                 "score": grade_obj.get("Score", 0),
@@ -262,7 +345,11 @@ def api_snapshots():
             })
         except Exception:
             pass
-    return jsonify({"snapshots": snapshots, "count": len(snapshots)})
+
+    result = {"snapshots": snapshots, "count": len(snapshots)}
+    _snapshot_cache["data"] = result
+    _snapshot_cache["ts"] = now
+    return jsonify(result)
 
 
 @app.route("/api/drift")

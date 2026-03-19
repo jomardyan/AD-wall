@@ -13,6 +13,41 @@
 
 Set-StrictMode -Version Latest
 
+#region Connection Cache
+# Reuse DirectoryEntry objects across multiple queries to avoid re-binding
+# to the DC for every collector function call.
+
+$Script:LdapEntryCache = @{}
+
+function Get-CachedDirectoryEntry {
+    <#
+    .SYNOPSIS
+        Returns a cached DirectoryEntry for the given LDAP root path, creating one if needed.
+    #>
+    param(
+        [string]$LdapRoot,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    $cacheKey = "$LdapRoot|$($Credential.UserName)"
+    if ($Script:LdapEntryCache.ContainsKey($cacheKey)) {
+        return $Script:LdapEntryCache[$cacheKey]
+    }
+    if ($null -ne $Credential) {
+        $entry = New-Object System.DirectoryServices.DirectoryEntry(
+            $LdapRoot,
+            $Credential.UserName,
+            $Credential.GetNetworkCredential().Password
+        )
+    }
+    else {
+        $entry = New-Object System.DirectoryServices.DirectoryEntry($LdapRoot)
+    }
+    $Script:LdapEntryCache[$cacheKey] = $entry
+    return $entry
+}
+
+#endregion
+
 #region Helper Functions
 
 function New-LdapSearcher {
@@ -47,16 +82,7 @@ function New-LdapSearcher {
             $root = "${root}/$SearchBase"
         }
 
-        if ($null -ne $Credential) {
-            $dirEntry = New-Object System.DirectoryServices.DirectoryEntry(
-                $root,
-                $Credential.UserName,
-                $Credential.GetNetworkCredential().Password
-            )
-        }
-        else {
-            $dirEntry = New-Object System.DirectoryServices.DirectoryEntry($root)
-        }
+        $dirEntry = Get-CachedDirectoryEntry -LdapRoot $root -Credential $Credential
 
         $searcher = New-Object System.DirectoryServices.DirectorySearcher($dirEntry)
         $searcher.Filter   = $Filter
@@ -847,4 +873,5 @@ function Get-ADFinePWPolicies {
 
 Export-ModuleMember -Function Get-ADUsers, Get-ADGroups, Get-ADComputers, Get-ADOUs,
                                Get-ADTrusts, Get-ADGPOs, Get-ADACLs, Get-ADDomainControllers,
-                               Get-ADPasswordPolicies, Get-ADFinePWPolicies
+                               Get-ADPasswordPolicies, Get-ADFinePWPolicies,
+                               Get-CachedDirectoryEntry

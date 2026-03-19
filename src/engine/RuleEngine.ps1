@@ -126,6 +126,12 @@ $Script:RuleCatalog = @(
     [PSCustomObject]@{ RuleId='ATK-022'; Category='Attack Techniques'; Name='RBCD (Resource-Based Constrained Delegation) Abuse';  Severity='High';     MitreAttack='T1134.001'; Enabled=$true }
 )
 
+# Pre-build a hashtable index for O(1) rule lookups instead of linear Where-Object scans
+$Script:RuleIndex = @{}
+foreach ($rule in $Script:RuleCatalog) {
+    $Script:RuleIndex[$rule.RuleId] = $rule
+}
+
 #endregion
 
 #region Functions
@@ -171,9 +177,10 @@ function Test-Rule {
     [CmdletBinding()]
     param([string]$RuleId)
 
-    $rule = $Script:RuleCatalog | Where-Object { $_.RuleId -eq $RuleId }
-    if ($null -eq $rule) { return $false }
-    return $rule.Enabled
+    if ($Script:RuleIndex.ContainsKey($RuleId)) {
+        return $Script:RuleIndex[$RuleId].Enabled
+    }
+    return $false
 }
 
 function Invoke-AllChecks {
@@ -369,10 +376,7 @@ function Invoke-FindingEnrichment {
     #>
     param([object[]]$Findings)
 
-    $ruleIndex = @{}
-    foreach ($rule in $Script:RuleCatalog) {
-        $ruleIndex[$rule.RuleId] = $rule
-    }
+    $ruleIndex = $Script:RuleIndex
 
     # Verification command lookup (PowerShell to run after remediation to confirm the fix)
     $verificationCommands = @{

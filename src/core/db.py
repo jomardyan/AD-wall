@@ -6,11 +6,18 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 _DB_PATH: str = ""
+
+# ---------------------------------------------------------------------------
+# Connection pool — reuse connections per-thread instead of opening a new one
+# for every single database call.  WAL mode makes concurrent reads safe.
+# ---------------------------------------------------------------------------
+_pool: threading.local = threading.local()
 
 
 def configure(db_path: str) -> None:
@@ -24,12 +31,21 @@ def configure(db_path: str) -> None:
 def _connect() -> sqlite3.Connection:
     if not _DB_PATH:
         raise RuntimeError("db.py: call configure(db_path) before using the database")
-    # check_same_thread=False is safe here because every caller opens its own
-    # connection (no shared global connection) and WAL mode enables concurrent reads.
+    conn = getattr(_pool, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except sqlite3.ProgrammingError:
+            # Connection was closed — fall through and create a new one.
+            pass
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-8000")  # 8 MB page cache
+    _pool.conn = conn
     return conn
 
 
@@ -96,8 +112,15 @@ def init_db() -> None:
             file_size INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
         );
+
+        -- Performance indexes
+        CREATE INDEX IF NOT EXISTS idx_findings_run_id   ON findings(run_id);
+        CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(run_id, severity);
+        CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(run_id, category);
+        CREATE INDEX IF NOT EXISTS idx_logs_run_id       ON logs(run_id, id);
+        CREATE INDEX IF NOT EXISTS idx_reports_run_id    ON reports(run_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_status       ON runs(status, started_at DESC);
         """)
-    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +150,11 @@ def create_run(run_id: str, params: dict) -> None:
                 json.dumps(params),
             ),
         )
-    conn.close()
 
 
 def get_run(run_id: str) -> Optional[dict]:
     conn = _connect()
     row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    conn.close()
     return dict(row) if row else None
 
 
@@ -142,7 +163,6 @@ def list_runs(limit: int = 100) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
     ).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -169,7 +189,6 @@ def complete_run(run_id: str, summary: dict) -> None:
                 run_id,
             ),
         )
-    conn.close()
 
 
 def fail_run(run_id: str, error: str) -> None:
@@ -179,7 +198,6 @@ def fail_run(run_id: str, error: str) -> None:
             "UPDATE runs SET status='failed', completed_at=? WHERE id=?",
             (_now_iso(), run_id),
         )
-    conn.close()
     add_log(run_id, f"FAILED: {error}", level="ERROR")
 
 
@@ -189,33 +207,34 @@ def fail_run(run_id: str, error: str) -> None:
 
 def save_findings(run_id: str, findings_list: list) -> None:
     conn = _connect()
+    rows = []
+    for f in findings_list:
+        ao = f.get("AffectedObjects") or f.get("affected_objects")
+        rows.append((
+            run_id,
+            f.get("RuleId") or f.get("rule_id"),
+            f.get("Severity") or f.get("severity"),
+            f.get("Category") or f.get("category"),
+            f.get("Title") or f.get("title"),
+            f.get("Description") or f.get("description"),
+            f.get("Remediation") or f.get("remediation"),
+            f.get("MitreAttack") or f.get("mitre_attack"),
+            f.get("AffectedCount") or f.get("affected_count") or 0,
+            json.dumps(ao) if ao is not None else None,
+            f.get("DetectedAt") or f.get("detected_at"),
+            f.get("VerificationCommand") or f.get("verification_command"),
+            f.get("CISControl") or f.get("cis_control"),
+            f.get("NISTControl") or f.get("nist_control"),
+        ))
     with conn:
-        for f in findings_list:
-            ao = f.get("AffectedObjects") or f.get("affected_objects")
-            conn.execute(
-                """INSERT INTO findings
-                   (run_id, rule_id, severity, category, title, description,
-                    remediation, mitre_attack, affected_count, affected_objects,
-                    detected_at, verification_command, cis_control, nist_control)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    run_id,
-                    f.get("RuleId") or f.get("rule_id"),
-                    f.get("Severity") or f.get("severity"),
-                    f.get("Category") or f.get("category"),
-                    f.get("Title") or f.get("title"),
-                    f.get("Description") or f.get("description"),
-                    f.get("Remediation") or f.get("remediation"),
-                    f.get("MitreAttack") or f.get("mitre_attack"),
-                    f.get("AffectedCount") or f.get("affected_count") or 0,
-                    json.dumps(ao) if ao is not None else None,
-                    f.get("DetectedAt") or f.get("detected_at"),
-                    f.get("VerificationCommand") or f.get("verification_command"),
-                    f.get("CISControl") or f.get("cis_control"),
-                    f.get("NISTControl") or f.get("nist_control"),
-                ),
-            )
-    conn.close()
+        conn.executemany(
+            """INSERT INTO findings
+               (run_id, rule_id, severity, category, title, description,
+                remediation, mitre_attack, affected_count, affected_objects,
+                detected_at, verification_command, cis_control, nist_control)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
 
 
 def get_findings(run_id: str, severity: str = None, category: str = None,
@@ -233,7 +252,6 @@ def get_findings(run_id: str, severity: str = None, category: str = None,
         sql += " AND (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)"
         params += [f"%{search.lower()}%", f"%{search.lower()}%"]
     rows = conn.execute(sql, params).fetchall()
-    conn.close()
     result = []
     for r in rows:
         d = dict(r)
@@ -273,6 +291,26 @@ def get_findings_api(run_id: str, severity: str = None, category: str = None,
     return out
 
 
+def get_severity_counts(run_id: str) -> dict:
+    """Return {severity: count} using SQL aggregation instead of Python loops."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT severity, COUNT(*) as cnt FROM findings WHERE run_id=? GROUP BY severity",
+        (run_id,),
+    ).fetchall()
+    return {r["severity"]: r["cnt"] for r in rows}
+
+
+def get_category_counts(run_id: str) -> dict:
+    """Return {category: count} using SQL aggregation instead of Python loops."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT category, COUNT(*) as cnt FROM findings WHERE run_id=? GROUP BY category",
+        (run_id,),
+    ).fetchall()
+    return {r["category"]: r["cnt"] for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # Logs
 # ---------------------------------------------------------------------------
@@ -284,7 +322,6 @@ def add_log(run_id: str, message: str, level: str = "INFO") -> None:
             "INSERT INTO logs (run_id, timestamp, level, message) VALUES (?,?,?,?)",
             (run_id, _now_iso(), level.upper(), message),
         )
-    conn.close()
 
 
 def get_logs(run_id: str, since_id: int = 0) -> list[dict]:
@@ -293,7 +330,6 @@ def get_logs(run_id: str, since_id: int = 0) -> list[dict]:
         "SELECT * FROM logs WHERE run_id=? AND id>? ORDER BY id ASC",
         (run_id, since_id),
     ).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -315,7 +351,6 @@ def register_report(run_id: str, filename: str, fmt: str, file_path: str) -> Non
                VALUES (?,?,?,?,?,?)""",
             (run_id, filename, fmt, file_path, _now_iso(), size),
         )
-    conn.close()
 
 
 def list_reports(run_id: str = None) -> list[dict]:
@@ -328,7 +363,6 @@ def list_reports(run_id: str = None) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM reports ORDER BY generated_at DESC"
         ).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -394,7 +428,6 @@ def import_json_assessment(json_path: str) -> str:
                 json.dumps({}),
             ),
         )
-    conn.close()
 
     if findings:
         save_findings(run_id, findings)
