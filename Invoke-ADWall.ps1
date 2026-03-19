@@ -591,23 +591,65 @@ $reportMeta = @{
     RedTeamCount     = $redTeamResults.Count
 }
 
-foreach ($fmt in $reportFormats) {
-    Write-Step "Generating $fmt report…" 'INFO'
-    try {
-        $file = switch ($fmt) {
-            'HTML'     { New-HTMLReport    -Findings $allFindings -PostureGrade $postureGrade -RemediationRoadmap $remediationRoad -QuickWins $quickWins -OutputPath $OutputPath -ReportTitle 'AD Security Assessment' -OrgName $OrgName }
-            'JSON'     { New-JSONReport    -Findings $allFindings -PostureGrade $postureGrade -RemediationRoadmap $remediationRoad -Metadata $reportMeta  -OutputPath $OutputPath }
-            'CSV'      { New-CSVReport     -Findings $allFindings -OutputPath $OutputPath }
-            'Markdown' { New-MarkdownReport -Findings $allFindings -PostureGrade $postureGrade -OutputPath $OutputPath }
-            'CEF'      { New-CEFReport      -Findings $allFindings -OutputPath $OutputPath }
-            'Splunk'   { New-SplunkReport   -Findings $allFindings -OutputPath $OutputPath }
-        }
-        if ($file) {
-            $generatedFiles += $file
-            Write-Step "  → $file" 'OK'
-        }
+# Generate reports in parallel using PowerShell runspaces when multiple formats are requested
+if ($reportFormats.Count -gt 1) {
+    Write-Step "Generating $($reportFormats.Count) reports in parallel…" 'INFO'
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [Math]::Min($reportFormats.Count, 4))
+    $runspacePool.Open()
+    $jobs = @()
+
+    foreach ($fmt in $reportFormats) {
+        $ps = [PowerShell]::Create().AddScript({
+            param($Format, $Findings, $PostureGrade, $RemediationRoadmap, $QuickWins, $OutputPath, $OrgName, $ReportMeta, $ScriptRoot)
+            # Re-load functions in the runspace
+            . (Join-Path $ScriptRoot 'src\reporting\ReportGenerator.ps1')
+            . (Join-Path $ScriptRoot 'src\reporting\WorkflowExport.ps1')
+            switch ($Format) {
+                'HTML'     { New-HTMLReport    -Findings $Findings -PostureGrade $PostureGrade -RemediationRoadmap $RemediationRoadmap -QuickWins $QuickWins -OutputPath $OutputPath -ReportTitle 'AD Security Assessment' -OrgName $OrgName }
+                'JSON'     { New-JSONReport    -Findings $Findings -PostureGrade $PostureGrade -RemediationRoadmap $RemediationRoadmap -Metadata $ReportMeta  -OutputPath $OutputPath }
+                'CSV'      { New-CSVReport     -Findings $Findings -OutputPath $OutputPath }
+                'Markdown' { New-MarkdownReport -Findings $Findings -PostureGrade $PostureGrade -OutputPath $OutputPath }
+                'CEF'      { New-CEFReport      -Findings $Findings -OutputPath $OutputPath }
+                'Splunk'   { New-SplunkReport   -Findings $Findings -OutputPath $OutputPath }
+            }
+        }).AddArgument($fmt).AddArgument($allFindings).AddArgument($postureGrade).AddArgument($remediationRoad).AddArgument($quickWins).AddArgument($OutputPath).AddArgument($OrgName).AddArgument($reportMeta).AddArgument($ScriptRoot)
+        $ps.RunspacePool = $runspacePool
+        $jobs += @{ PS = $ps; Handle = $ps.BeginInvoke(); Format = $fmt }
     }
-    catch { Write-Step "  Failed to generate $fmt report: $_" 'WARN' }
+
+    foreach ($job in $jobs) {
+        try {
+            $file = $job.PS.EndInvoke($job.Handle)
+            if ($file) {
+                $generatedFiles += $file
+                Write-Step "  → $file" 'OK'
+            }
+        }
+        catch { Write-Step "  Failed to generate $($job.Format) report: $_" 'WARN' }
+        finally { $job.PS.Dispose() }
+    }
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+}
+else {
+    foreach ($fmt in $reportFormats) {
+        Write-Step "Generating $fmt report…" 'INFO'
+        try {
+            $file = switch ($fmt) {
+                'HTML'     { New-HTMLReport    -Findings $allFindings -PostureGrade $postureGrade -RemediationRoadmap $remediationRoad -QuickWins $quickWins -OutputPath $OutputPath -ReportTitle 'AD Security Assessment' -OrgName $OrgName }
+                'JSON'     { New-JSONReport    -Findings $allFindings -PostureGrade $postureGrade -RemediationRoadmap $remediationRoad -Metadata $reportMeta  -OutputPath $OutputPath }
+                'CSV'      { New-CSVReport     -Findings $allFindings -OutputPath $OutputPath }
+                'Markdown' { New-MarkdownReport -Findings $allFindings -PostureGrade $postureGrade -OutputPath $OutputPath }
+                'CEF'      { New-CEFReport      -Findings $allFindings -OutputPath $OutputPath }
+                'Splunk'   { New-SplunkReport   -Findings $allFindings -OutputPath $OutputPath }
+            }
+            if ($file) {
+                $generatedFiles += $file
+                Write-Step "  → $file" 'OK'
+            }
+        }
+        catch { Write-Step "  Failed to generate $fmt report: $_" 'WARN' }
+    }
 }
 
 # SIEM export if requested
